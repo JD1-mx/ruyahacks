@@ -19,6 +19,12 @@ import { resetToBaseline, BASELINE } from "./baseline.js";
 const app = express();
 app.use(express.json());
 
+// --- Root health check ---
+
+app.get("/", (_req, res) => {
+  res.json({ status: "ok", service: "ruya-logistics-agent" });
+});
+
 // --- Vapi webhook: tool calls ---
 
 app.post("/vapi/tool-calls", async (req, res) => {
@@ -112,9 +118,21 @@ app.post("/vapi/server-message", async (req, res) => {
   res.json({ ok: true });
 });
 
+// --- Whapi webhook: verification (GET) ---
+
+app.get("/whapi/incoming", (_req, res) => {
+  res.json({ ok: true });
+});
+
 // --- Whapi webhook: incoming WhatsApp ---
 
 app.post("/whapi/incoming", async (req, res) => {
+  // Handle Whapi webhook verification / health pings
+  if (!req.body || Object.keys(req.body).length === 0) {
+    res.json({ ok: true });
+    return;
+  }
+
   const payload = req.body as WhapiIncomingMessage;
 
   if (!payload.messages?.length) {
