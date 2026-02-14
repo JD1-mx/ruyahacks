@@ -14,7 +14,7 @@ export const BASELINE: AssistantConfig = {
   messagePlan: {
     idleMessages: [],
     idleTimeoutSeconds: 10,
-    idleMessageMaxSpokenCount: 0,
+    idleMessageMaxSpokenCount: 1,
   },
 };
 

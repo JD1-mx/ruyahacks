@@ -322,7 +322,8 @@ export async function analyzeAndImprove(
   // 7. Final verification — fetch assistant to confirm tools are attached
   try {
     const updated = await getAssistant(assistantId);
-    const currentToolIds = (updated.config as { toolIds?: string[] })?.toolIds || [];
+    const currentModel = (updated.config as { model?: { toolIds?: string[] } })?.model;
+    const currentToolIds = currentModel?.toolIds || [];
     logStep(log, "verify_assistant", "ok", `Assistant published with ${currentToolIds.length} tools attached. Prompt length: ${updated.systemMessage.length} chars`);
   } catch {
     logStep(log, "verify_assistant", "error", "Could not verify final assistant state");
@@ -535,9 +536,8 @@ Only include newWorkflows if multi-step automations are needed (WhatsApp, email,
 Only include resourceRequests if you truly need credentials you don't have access to.
 
 HOW PROMPT UPDATES WORK: When you set "systemMessage" in configChanges, it gets applied to the
-VAPI assistant via the "instructions" field (PATCH /assistant/{id} with { instructions: "..." }).
-This is the correct way to update the agent's behavior on VAPI. The system will handle this automatically
-— just put the full improved prompt in configChanges.systemMessage.`,
+VAPI assistant via PATCH /assistant/{id} with { model: { messages: [{ role: "system", content: "..." }] } }.
+The system handles this automatically — just put the full improved prompt in configChanges.systemMessage.`,
     messages: [
       {
         role: "user",
