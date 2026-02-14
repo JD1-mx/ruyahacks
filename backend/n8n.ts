@@ -1,4 +1,4 @@
-const N8N_API_URL = process.env.N8N_API_URL || ""; // e.g. https://your-n8n.app/api/v1
+const N8N_API_URL = process.env.N8N_API_URL || "";
 const N8N_API_KEY = process.env.N8N_API_KEY || "";
 
 async function n8nRequest(
@@ -23,7 +23,7 @@ async function n8nRequest(
   return res.json();
 }
 
-// --- Workflow CRUD ---
+// --- Types ---
 
 export interface N8nWorkflow {
   id?: string;
@@ -44,6 +44,24 @@ export interface N8nNode {
   credentials?: Record<string, { id: string; name: string }>;
 }
 
+// --- Read existing workflows (so the AI can learn from them) ---
+
+export async function listWorkflows(): Promise<{ id: string; name: string; active: boolean; nodes: string[] }[]> {
+  const result = (await n8nRequest("/workflows", "GET")) as { data: N8nWorkflow[] };
+  return (result.data || []).map((w) => ({
+    id: w.id!,
+    name: w.name,
+    active: w.active || false,
+    nodes: w.nodes.map((n) => `${n.name} (${n.type})`),
+  }));
+}
+
+export async function getWorkflow(workflowId: string): Promise<N8nWorkflow> {
+  return n8nRequest(`/workflows/${workflowId}`, "GET") as Promise<N8nWorkflow>;
+}
+
+// --- Create and activate ---
+
 export async function createWorkflow(workflow: N8nWorkflow): Promise<{ id: string; name: string }> {
   const result = (await n8nRequest("/workflows", "POST", workflow)) as { id: string; name: string };
   console.log(`[n8n] Created workflow "${result.name}" → ${result.id}`);
@@ -55,93 +73,7 @@ export async function activateWorkflow(workflowId: string): Promise<void> {
   console.log(`[n8n] Activated workflow ${workflowId}`);
 }
 
-export async function getWorkflow(workflowId: string): Promise<N8nWorkflow> {
-  return n8nRequest(`/workflows/${workflowId}`, "GET") as Promise<N8nWorkflow>;
-}
-
-// --- WhatsApp Workflow Template ---
-// Creates a workflow: Webhook Trigger → HTTP Request to Whapi → Response
-
-export async function createWhatsAppWorkflow(opts: {
-  name: string;
-  webhookPath: string;
-  whapiToken: string;
-}): Promise<{ workflowId: string; webhookUrl: string }> {
-  const workflow: N8nWorkflow = {
-    name: opts.name,
-    nodes: [
-      {
-        id: "webhook-trigger",
-        name: "Webhook",
-        type: "n8n-nodes-base.webhook",
-        typeVersion: 1.1,
-        position: [240, 300],
-        parameters: {
-          httpMethod: "POST",
-          path: opts.webhookPath,
-          responseMode: "lastNode",
-          options: {},
-        },
-      },
-      {
-        id: "send-whatsapp",
-        name: "Send WhatsApp",
-        type: "n8n-nodes-base.httpRequest",
-        typeVersion: 4.1,
-        position: [480, 300],
-        parameters: {
-          method: "POST",
-          url: "https://gate.whapi.cloud/messages/text",
-          sendHeaders: true,
-          headerParameters: {
-            parameters: [
-              { name: "Authorization", value: `Bearer ${opts.whapiToken}` },
-              { name: "Content-Type", value: "application/json" },
-            ],
-          },
-          sendBody: true,
-          specifyBody: "json",
-          jsonBody: `={
-  "to": "{{ $json.body.to }}",
-  "body": "{{ $json.body.message }}"
-}`,
-          options: { timeout: 10000 },
-        },
-      },
-      {
-        id: "respond",
-        name: "Respond",
-        type: "n8n-nodes-base.respondToWebhook",
-        typeVersion: 1,
-        position: [720, 300],
-        parameters: {
-          respondWith: "json",
-          responseBody: `={ "sent": true, "workflow": "${opts.name}" }`,
-          options: {},
-        },
-      },
-    ],
-    connections: {
-      Webhook: {
-        main: [[{ node: "Send WhatsApp", type: "main", index: 0 }]],
-      },
-      "Send WhatsApp": {
-        main: [[{ node: "Respond", type: "main", index: 0 }]],
-      },
-    },
-    settings: { executionOrder: "v1" },
-  };
-
-  const result = await createWorkflow(workflow);
-  await activateWorkflow(result.id);
-
-  const webhookUrl = `${N8N_API_URL.replace("/api/v1", "")}/webhook/${opts.webhookPath}`;
-
-  console.log(`[n8n] WhatsApp workflow ready: ${webhookUrl}`);
-  return { workflowId: result.id, webhookUrl };
-}
-
-// --- Generic workflow builder for the self-improving engine ---
+// --- Generic workflow builder ---
 
 export async function createCustomWorkflow(spec: {
   name: string;
@@ -204,7 +136,6 @@ export async function createCustomWorkflow(spec: {
     prevNodeName = nodeName;
   });
 
-  // Add respond node
   nodes.push({
     id: "respond",
     name: "Respond",
@@ -232,7 +163,7 @@ export async function createCustomWorkflow(spec: {
   await activateWorkflow(result.id);
 
   const webhookUrl = `${N8N_API_URL.replace("/api/v1", "")}/webhook/${spec.webhookPath}`;
-  console.log(`[n8n] Custom workflow "${spec.name}" ready: ${webhookUrl}`);
+  console.log(`[n8n] Workflow "${spec.name}" deployed: ${webhookUrl}`);
   return { workflowId: result.id, webhookUrl };
 }
 

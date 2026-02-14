@@ -8,7 +8,7 @@ import {
 } from "./vapi.js";
 import { notifyOperator } from "./integrations.js";
 import { createAndRegisterTool, getAllTools } from "./tools.js";
-import { createWhatsAppWorkflow, createCustomWorkflow, isN8nConfigured } from "./n8n.js";
+import { createCustomWorkflow, isN8nConfigured, listWorkflows, getWorkflow } from "./n8n.js";
 
 const client = new Anthropic();
 
@@ -85,10 +85,7 @@ a capability, you MUST create it. That is your entire purpose.
 
 You have TWO ways to create capabilities:
 
-== 1. VAPI TOOLS (for things the voice assistant calls during a conversation) ==
-These are functions the assistant can invoke mid-call. You create them as tool specs,
-and they get registered on both our server AND on Vapi so the assistant can use them.
-
+== 1. VAPI TOOLS (callable by the voice assistant during a call) ==
 Tool spec format:
 {
   "name": "snake_case_tool_name",
@@ -101,18 +98,9 @@ Tool spec format:
   "handlerCode": "JS code with access to ctx.sendWhatsApp(phone, msg), ctx.notifyOperator(msg), ctx.triggerN8nWorkflow(data), ctx.fetch(url, opts). MUST return a string."
 }
 
-== 2. N8N WORKFLOWS (for multi-step automations the tools trigger) ==
-If you need a WhatsApp messaging workflow, an email workflow, or any multi-step automation,
-you can create it as an n8n workflow. The system will deploy it to n8n and give you a webhook URL.
-
-n8n workflow spec format:
-{
-  "type": "whatsapp",
-  "name": "Workflow Name",
-  "webhookPath": "unique-path-name"
-}
-
-Or for custom multi-step workflows:
+== 2. N8N WORKFLOWS (multi-step automations deployed to n8n) ==
+You can create workflows on n8n that get a webhook URL you can call from tools.
+Workflow spec format:
 {
   "type": "custom",
   "name": "Workflow Name",
@@ -128,18 +116,18 @@ Or for custom multi-step workflows:
   ]
 }
 
-The workflow will be created, activated, and its webhook URL returned. You can then create
-a Vapi tool whose handlerCode calls this webhook URL.
+== HINTS ==
+- If WhatsApp messaging is needed, you should prefer Whapi (https://gate.whapi.cloud).
+  Research the Whapi API for how to send messages. Look at the EXISTING WORKFLOWS below
+  for any WhatsApp integrations already built in this n8n account — use those as reference
+  for how it's been done before. Pick the best pattern you find.
+- For email, look at existing n8n workflows for email patterns.
+- For data lookups, create a Vapi tool directly with ctx.fetch().
+- You can chain: create an n8n workflow first, then a Vapi tool that calls its webhook.
 
-== STRATEGY ==
-For WhatsApp: Create an n8n WhatsApp workflow FIRST, then create a Vapi tool that triggers it.
-For email: Create an n8n email workflow, then a Vapi tool for it.
-For data lookups: Create a Vapi tool directly with ctx.fetch().
+If you need an API key or credential you don't have, add it to "resourceRequests".
 
-If you need an API key or credential you don't have, add it to "resourceRequests" — the system
-will ask the operator via WhatsApp.
-
-IMPORTANT: Don't be afraid to create tools and workflows. That IS the point.
+IMPORTANT: Don't be afraid to create tools and workflows. Figure it out. That IS the point.
 `;
 
 // --- Core: Full self-improvement pipeline ---
@@ -205,24 +193,17 @@ export async function analyzeAndImprove(
   if (analysis.newWorkflows?.length && isN8nConfigured()) {
     for (const wf of analysis.newWorkflows) {
       try {
-        console.log(`[self-improve] Creating n8n workflow: "${wf.name}" (${wf.type})`);
-        let result;
-        if (wf.type === "whatsapp") {
-          result = await createWhatsAppWorkflow({
-            name: wf.name,
-            webhookPath: wf.webhookPath,
-            whapiToken: process.env.WHAPI_TOKEN || "",
-          });
-        } else if (wf.type === "custom" && wf.steps) {
-          result = await createCustomWorkflow({
+        console.log(`[self-improve] Creating n8n workflow: "${wf.name}"`);
+        if (wf.steps?.length) {
+          const result = await createCustomWorkflow({
             name: wf.name,
             webhookPath: wf.webhookPath,
             steps: wf.steps,
           });
-        }
-        if (result) {
           workflowsCreated.push({ name: wf.name, webhookUrl: result.webhookUrl });
           console.log(`[self-improve] ✅ Workflow "${wf.name}" deployed: ${result.webhookUrl}`);
+        } else {
+          console.warn(`[self-improve] Workflow "${wf.name}" has no steps — skipping`);
         }
       } catch (err) {
         console.error(`[self-improve] Failed to create workflow "${wf.name}":`, err);
@@ -334,10 +315,10 @@ interface AnalysisResult {
     handlerCode: string;
   }[];
   newWorkflows?: {
-    type: "whatsapp" | "custom";
+    type: "custom";
     name: string;
     webhookPath: string;
-    steps?: {
+    steps: {
       name: string;
       method: string;
       url: string;
@@ -358,6 +339,35 @@ async function analyzeTranscript(
     ? existingTools.map((t) => `- ${t.name}: ${t.description}`).join("\n")
     : "NO TOOLS CONFIGURED";
 
+  // Fetch existing n8n workflows so the AI can reference them
+  let existingWorkflows = "N8N NOT CONFIGURED";
+  if (isN8nConfigured()) {
+    try {
+      const workflows = await listWorkflows();
+      if (workflows.length) {
+        // Get full details of up to 5 workflows for reference
+        const details = await Promise.all(
+          workflows.slice(0, 5).map(async (w) => {
+            try {
+              const full = await getWorkflow(w.id);
+              const nodesSummary = full.nodes.map((n) =>
+                `    - ${n.name} (${n.type}): ${JSON.stringify(n.parameters).slice(0, 200)}`
+              ).join("\n");
+              return `  [${w.active ? "ACTIVE" : "inactive"}] "${w.name}" (${w.id})\n${nodesSummary}`;
+            } catch {
+              return `  [${w.active ? "ACTIVE" : "inactive"}] "${w.name}" (${w.id}) — nodes: ${w.nodes.join(", ")}`;
+            }
+          })
+        );
+        existingWorkflows = details.join("\n\n");
+      } else {
+        existingWorkflows = "NO WORKFLOWS EXIST YET";
+      }
+    } catch (err) {
+      existingWorkflows = `FAILED TO FETCH: ${(err as Error).message}`;
+    }
+  }
+
   const response = await client.messages.create({
     model: "claude-sonnet-4-5-20250929",
     max_tokens: 4096,
@@ -372,8 +382,11 @@ ${TUNABLE_PARAMETERS}
 
 ${TOOL_CREATION_HINTS}
 
-EXISTING TOOLS:
+EXISTING TOOLS ON VAPI:
 ${toolList}
+
+EXISTING N8N WORKFLOWS (reference these for patterns — especially any WhatsApp/Whapi integrations):
+${existingWorkflows}
 
 Your job:
 1. Read the transcript and identify EVERY specific failure
@@ -415,9 +428,18 @@ Respond with ONLY valid JSON:
   ],
   "newWorkflows": [
     {
-      "type": "whatsapp",
+      "type": "custom",
       "name": "Send Customer WhatsApp",
-      "webhookPath": "send-customer-whatsapp"
+      "webhookPath": "send-customer-whatsapp",
+      "steps": [
+        {
+          "name": "Send via Whapi",
+          "method": "POST",
+          "url": "https://gate.whapi.cloud/messages/text",
+          "headers": { "Authorization": "Bearer WHAPI_TOKEN", "Content-Type": "application/json" },
+          "bodyTemplate": "={ \"to\": \"{{ $json.body.to }}\", \"body\": \"{{ $json.body.message }}\" }"
+        }
+      ]
     }
   ],
   "resourceRequests": [
