@@ -8,7 +8,6 @@ import { SubHeading } from "@/components/subheading";
 import { Button } from "@/components/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
 import {
   Phone,
   ArrowLeft,
@@ -25,8 +24,6 @@ type DemoState = "form" | "confirm" | "calling" | "completed";
 interface FormData {
   name: string;
   company: string;
-  scenario: string;
-  scenarioDetails: string;
   phone: string;
   email: string;
 }
@@ -59,25 +56,12 @@ interface Improvement {
   toolsCreated?: Array<{ name: string; description: string }>;
 }
 
-const SCENARIOS = [
-  {
-    value: "shipment-status",
-    label: "Shipment Status Inquiry",
-    description:
-      "Ask about the status of a container shipment from Jebel Ali port to a Dubai warehouse.",
-  },
-  {
-    value: "delivery-coordination",
-    label: "Delivery Coordination",
-    description:
-      "Coordinate delivery timing, truck assignments, and warehouse availability.",
-  },
-  {
-    value: "custom",
-    label: "Custom Scenario",
-    description: "Describe your own logistics scenario for the AI agent.",
-  },
-];
+const DEFAULT_SCENARIO = {
+  value: "logistics-demo",
+  label: "Logistics AI Agent Demo",
+  description:
+    "Our AI agent will call you to help coordinate container shipments from Jebel Ali port. It starts with limited capabilities and improves itself after each interaction.",
+};
 
 const fadeVariants = {
   initial: { opacity: 0, y: 20 },
@@ -90,8 +74,6 @@ export default function DemoPage() {
   const [form, setForm] = useState<FormData>({
     name: "",
     company: "",
-    scenario: "",
-    scenarioDetails: "",
     phone: "",
     email: "",
   });
@@ -111,7 +93,7 @@ export default function DemoPage() {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const improvePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const selectedScenario = SCENARIOS.find((s) => s.value === form.scenario);
+  const selectedScenario = DEFAULT_SCENARIO;
 
   const updateField = (field: keyof FormData, value: string) => {
     setForm((prev) => ({ ...prev, [field]: value }));
@@ -124,7 +106,10 @@ export default function DemoPage() {
       const res = await fetch("/api/demo", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(form),
+        body: JSON.stringify({
+          ...form,
+          scenario: DEFAULT_SCENARIO.value,
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to create call");
@@ -225,8 +210,6 @@ export default function DemoPage() {
     setForm({
       name: "",
       company: "",
-      scenario: "",
-      scenarioDetails: "",
       phone: "",
       email: "",
     });
@@ -265,8 +248,7 @@ export default function DemoPage() {
     return `${m}:${s.toString().padStart(2, "0")}`;
   };
 
-  const canSubmit =
-    form.name && form.phone && form.scenario && !submitting;
+  const canSubmit = form.name && form.phone && !submitting;
 
   return (
     <Container className="min-h-[80vh] px-4 py-8 md:py-16">
@@ -311,44 +293,12 @@ export default function DemoPage() {
                 />
               </div>
 
-              <div>
-                <Label htmlFor="scenario">Demo Scenario *</Label>
-                <select
-                  id="scenario"
-                  value={form.scenario}
-                  onChange={(e) => updateField("scenario", e.target.value)}
-                  className="border-input shadow-aceternity mt-1.5 flex h-9 w-full rounded-md border bg-transparent px-3 py-1 text-base outline-none md:text-sm dark:bg-neutral-800"
-                >
-                  <option value="">Select a scenario...</option>
-                  {SCENARIOS.map((s) => (
-                    <option key={s.value} value={s.value}>
-                      {s.label}
-                    </option>
-                  ))}
-                </select>
-                {selectedScenario && (
-                  <p className="mt-1.5 text-sm text-muted-foreground">
-                    {selectedScenario.description}
-                  </p>
-                )}
+              <div className="rounded-lg border border-brand/20 bg-brand/5 p-4 dark:border-brand/30 dark:bg-brand/10">
+                <p className="text-sm font-medium">{selectedScenario.label}</p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  {selectedScenario.description}
+                </p>
               </div>
-
-              {form.scenario === "custom" && (
-                <div>
-                  <Label htmlFor="scenarioDetails">
-                    Describe your scenario
-                  </Label>
-                  <Textarea
-                    id="scenarioDetails"
-                    placeholder="E.g., I need to arrange cold-chain transport for pharmaceuticals..."
-                    value={form.scenarioDetails}
-                    onChange={(e) =>
-                      updateField("scenarioDetails", e.target.value)
-                    }
-                    className="mt-1.5"
-                  />
-                </div>
-              )}
 
               <div>
                 <Label htmlFor="phone">Phone Number *</Label>
@@ -456,12 +406,6 @@ export default function DemoPage() {
                     <dd className="font-medium">{form.company}</dd>
                   </div>
                 )}
-                <div className="flex justify-between">
-                  <dt className="text-muted-foreground">Scenario</dt>
-                  <dd className="font-medium">
-                    {selectedScenario?.label}
-                  </dd>
-                </div>
                 <div className="flex justify-between">
                   <dt className="text-muted-foreground">Phone</dt>
                   <dd className="font-medium">{form.phone}</dd>
