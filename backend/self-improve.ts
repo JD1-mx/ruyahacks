@@ -304,7 +304,8 @@ export async function analyzeAndImprove(
     await new Promise((resolve) => setTimeout(resolve, 3000));
 
     try {
-      const callbackId = await createOutboundCall(assistantId, customerNumber);
+      const phoneNumberId = process.env.VAPI_PHONE_NUMBER_ID;
+      const callbackId = await createOutboundCall(assistantId, customerNumber, phoneNumberId);
       record.callbackTriggered = true;
       console.log(`[self-improve] Callback initiated: ${callbackId}`);
     } catch (err) {
@@ -573,7 +574,8 @@ export async function analyzeFromTranscript(
   if (customerNumber) {
     await new Promise((resolve) => setTimeout(resolve, 3000));
     try {
-      await createOutboundCall(assistantId, customerNumber);
+      const phoneNumberId = process.env.VAPI_PHONE_NUMBER_ID;
+      await createOutboundCall(assistantId, customerNumber, phoneNumberId);
       record.callbackTriggered = true;
     } catch (err) {
       console.error(`[self-improve] Callback failed:`, err);
