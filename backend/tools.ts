@@ -14,11 +14,24 @@ export function getAllTools(): RegisteredTool[] {
   return Array.from(registry.values());
 }
 
+export function getDynamicTools(): RegisteredTool[] {
+  return Array.from(registry.values()).filter((t) => t.isDynamic);
+}
+
 export function registerTool(tool: RegisteredTool) {
   registry.set(tool.name, tool);
   console.log(
     `[tools] Registered "${tool.name}" (${tool.isDynamic ? "dynamic" : "seed"})`
   );
+}
+
+export function clearDynamicTools() {
+  for (const [name, tool] of registry) {
+    if (tool.isDynamic) {
+      registry.delete(name);
+      console.log(`[tools] Removed dynamic tool "${name}"`);
+    }
+  }
 }
 
 // --- Dynamic tool creation (the self-improving part) ---

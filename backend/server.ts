@@ -5,7 +5,7 @@ import type {
   VapiServerMessage,
   WhapiIncomingMessage,
 } from "./types.js";
-import { getTool, getAllTools } from "./tools.js";
+import { getTool, getAllTools, getDynamicTools } from "./tools.js";
 import { decide } from "./brain.js";
 import { sendWhatsApp } from "./integrations.js";
 import {
@@ -13,11 +13,8 @@ import {
   analyzeFromTranscript,
   getImprovementHistory,
 } from "./self-improve.js";
-import {
-  getAssistant,
-  createOutboundCall,
-  getCall,
-} from "./vapi.js";
+import { getAssistant, createOutboundCall, getCall } from "./vapi.js";
+import { resetToBaseline, BASELINE } from "./baseline.js";
 
 const app = express();
 app.use(express.json());
@@ -52,9 +49,9 @@ app.post("/vapi/tool-calls", async (req, res) => {
         });
       }
     } else {
-      console.log(`[vapi] Tool "${name}" not found — asking brain to handle`);
+      console.log(`[vapi] Tool "${name}" not found — asking brain`);
       const { result } = await decide(
-        `The voice assistant tried to call tool "${name}" with args ${JSON.stringify(args)}, but it doesn't exist. Figure out what the caller needs and either create this tool or use an existing one.`,
+        `Tool "${name}" was called with ${JSON.stringify(args)} but doesn't exist. Handle this request.`,
         {
           callerPhone: payload.message.call?.customer?.number,
           channel: "vapi",
@@ -83,12 +80,13 @@ app.post("/vapi/server-message", async (req, res) => {
     const assistantId =
       payload.message.call?.assistantId || process.env.VAPI_ASSISTANT_ID;
     const endedReason = payload.message.endedReason;
+    const customerNumber = payload.message.call?.customer?.number;
 
     console.log(
-      `[vapi] Call ended: ${callId}, reason: ${endedReason}`
+      `[vapi] Call ended: ${callId}, reason: ${endedReason}, customer: ${customerNumber}`
     );
 
-    // Trigger self-improvement if the call ended badly
+    // Trigger self-improvement on bad endings
     const badEndings = [
       "customer-ended-call",
       "customer-did-not-answer",
@@ -99,11 +97,11 @@ app.post("/vapi/server-message", async (req, res) => {
 
     if (callId && assistantId && shouldImprove) {
       console.log(
-        `[vapi] Bad call ending detected (${endedReason}) — triggering self-improvement`
+        `[vapi] Bad ending (${endedReason}) — triggering full self-improvement pipeline`
       );
-      // Don't await — respond to webhook fast, improve in background
-      analyzeAndImprove(callId, assistantId).catch((err) =>
-        console.error("[self-improve] Error:", err)
+      // Fire and forget — respond to webhook fast
+      analyzeAndImprove(callId, assistantId, customerNumber).catch((err) =>
+        console.error("[self-improve] Pipeline error:", err)
       );
     }
 
@@ -111,11 +109,10 @@ app.post("/vapi/server-message", async (req, res) => {
     return;
   }
 
-  // Respond to other message types Vapi sends
   res.json({ ok: true });
 });
 
-// --- Whapi webhook: incoming WhatsApp messages ---
+// --- Whapi webhook: incoming WhatsApp ---
 
 app.post("/whapi/incoming", async (req, res) => {
   const payload = req.body as WhapiIncomingMessage;
@@ -129,11 +126,10 @@ app.post("/whapi/incoming", async (req, res) => {
     const text = msg.text?.body;
     if (!text) continue;
 
-    const from = msg.from;
-    console.log(`[whapi] Message from ${from}: ${text}`);
+    console.log(`[whapi] Message from ${msg.from}: ${text}`);
 
     const { result } = await decide(text, {
-      callerPhone: from,
+      callerPhone: msg.from,
       channel: "whatsapp",
     });
 
@@ -148,9 +144,10 @@ app.post("/whapi/incoming", async (req, res) => {
 // --- Self-improvement: manual trigger ---
 
 app.post("/improve", async (req, res) => {
-  const { callId, transcript } = req.body as {
+  const { callId, transcript, customerNumber } = req.body as {
     callId?: string;
     transcript?: string;
+    customerNumber?: string;
   };
   const assistantId = process.env.VAPI_ASSISTANT_ID;
 
@@ -162,9 +159,9 @@ app.post("/improve", async (req, res) => {
   try {
     let record;
     if (callId) {
-      record = await analyzeAndImprove(callId, assistantId);
+      record = await analyzeAndImprove(callId, assistantId, customerNumber);
     } else if (transcript) {
-      record = await analyzeFromTranscript(transcript, assistantId);
+      record = await analyzeFromTranscript(transcript, assistantId, customerNumber);
     } else {
       res.status(400).json({ error: "Provide callId or transcript" });
       return;
@@ -230,9 +227,12 @@ app.get("/health", (_req, res) => {
 
   const improvements = getImprovementHistory().map((r) => ({
     callId: r.callId,
+    customerNumber: r.customerNumber,
     timestamp: r.timestamp,
     failures: r.failures,
     changes: r.changes,
+    toolsCreated: r.toolsCreated,
+    callbackTriggered: r.callbackTriggered,
   }));
 
   res.json({
@@ -245,7 +245,7 @@ app.get("/health", (_req, res) => {
   });
 });
 
-// --- Current prompt (for demo visibility) ---
+// --- Current prompt ---
 
 app.get("/prompt", async (_req, res) => {
   const assistantId = process.env.VAPI_ASSISTANT_ID;
@@ -257,6 +257,73 @@ app.get("/prompt", async (_req, res) => {
   try {
     const assistant = await getAssistant(assistantId);
     res.json({ systemMessage: assistant.systemMessage });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// --- Reset to baseline ---
+
+app.post("/reset", async (_req, res) => {
+  const assistantId = process.env.VAPI_ASSISTANT_ID;
+  if (!assistantId) {
+    res.status(400).json({ error: "VAPI_ASSISTANT_ID not set" });
+    return;
+  }
+
+  try {
+    await resetToBaseline(assistantId);
+    res.json({
+      ok: true,
+      message: "Reset to baseline. Assistant prompt is weak, tools cleared, history wiped.",
+      baseline: BASELINE,
+    });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// --- Get baseline config ---
+
+app.get("/baseline", (_req, res) => {
+  res.json({ baseline: BASELINE });
+});
+
+// --- Full state: before vs after comparison ---
+
+app.get("/state", async (_req, res) => {
+  const assistantId = process.env.VAPI_ASSISTANT_ID;
+  if (!assistantId) {
+    res.status(400).json({ error: "VAPI_ASSISTANT_ID not set" });
+    return;
+  }
+
+  try {
+    const assistant = await getAssistant(assistantId);
+    const dynamicTools = getDynamicTools().map((t) => ({
+      name: t.name,
+      description: t.description,
+      createdAt: t.createdAt,
+      params: Object.keys(t.parameters.properties),
+    }));
+    const improvements = getImprovementHistory();
+
+    res.json({
+      baseline: BASELINE,
+      current: {
+        systemMessage: assistant.systemMessage,
+        config: assistant.config,
+      },
+      dynamicToolsCreated: dynamicTools,
+      improvements: improvements.map((r) => ({
+        callId: r.callId,
+        timestamp: r.timestamp,
+        failures: r.failures,
+        changes: r.changes,
+        toolsCreated: r.toolsCreated,
+        callbackTriggered: r.callbackTriggered,
+      })),
+    });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }
@@ -281,18 +348,22 @@ app.post("/test/brain", async (req, res) => {
 
 // --- Start ---
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = Number(process.env.PORT) || 3001;
 app.listen(PORT, () => {
   const tools = getAllTools();
   console.log(`\n🚀 Ruya Logistics Agent running on port ${PORT}`);
   console.log(`📋 ${tools.length} seed tools loaded`);
+  console.log(`🤖 Assistant: ${process.env.VAPI_ASSISTANT_ID || "NOT SET"}`);
   console.log(`\nEndpoints:`);
   console.log(`  POST /vapi/tool-calls      — Vapi tool call webhook`);
-  console.log(`  POST /vapi/server-message   — Vapi end-of-call webhook`);
+  console.log(`  POST /vapi/server-message   — End-of-call → self-improvement pipeline`);
   console.log(`  POST /whapi/incoming        — WhatsApp incoming`);
-  console.log(`  POST /improve              — Trigger self-improvement (callId or transcript)`);
+  console.log(`  POST /improve              — Manual self-improvement (callId/transcript)`);
   console.log(`  POST /calls/create         — Create outbound call`);
+  console.log(`  POST /reset                — Reset assistant to weak baseline`);
   console.log(`  GET  /calls/:id            — Get call transcript`);
   console.log(`  GET  /prompt               — View current assistant prompt`);
+  console.log(`  GET  /baseline             — View baseline config`);
+  console.log(`  GET  /state                — Full before/after comparison`);
   console.log(`  GET  /health               — Tools + improvement history\n`);
 });

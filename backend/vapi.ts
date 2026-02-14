@@ -27,6 +27,78 @@ async function vapiRequest(
 
 // --- Assistant management ---
 
+export interface AssistantConfig {
+  systemMessage?: string;
+  maxTokens?: number;
+  firstMessage?: string;
+  voiceSpeed?: number;
+  silenceTimeoutSeconds?: number;
+  maxDurationSeconds?: number;
+  messagePlan?: {
+    idleMessages?: string[];
+    idleMessageMaxSpokenCount?: number;
+    idleTimeoutSeconds?: number;
+  };
+  toolIds?: string[];
+  [key: string]: unknown;
+}
+
+export async function getAssistant(
+  assistantId: string
+): Promise<{ systemMessage: string; config: Record<string, unknown> }> {
+  const result = (await vapiRequest(
+    `/assistant/${assistantId}`,
+    "GET"
+  )) as Record<string, unknown>;
+  const model = result.model as { systemMessage?: string } | undefined;
+  return {
+    systemMessage: model?.systemMessage || "",
+    config: result,
+  };
+}
+
+export async function updateAssistant(
+  assistantId: string,
+  changes: AssistantConfig
+): Promise<void> {
+  const patch: Record<string, unknown> = {};
+
+  // Model-level changes
+  const modelPatch: Record<string, unknown> = {};
+  if (changes.systemMessage !== undefined) modelPatch.systemMessage = changes.systemMessage;
+  if (changes.maxTokens !== undefined) modelPatch.maxTokens = changes.maxTokens;
+  if (changes.toolIds !== undefined) modelPatch.toolIds = changes.toolIds;
+  if (Object.keys(modelPatch).length > 0) patch.model = modelPatch;
+
+  // Voice speed
+  if (changes.voiceSpeed !== undefined) {
+    patch.voice = { speed: changes.voiceSpeed };
+  }
+
+  // First message
+  if (changes.firstMessage !== undefined) patch.firstMessage = changes.firstMessage;
+
+  // Silence / duration
+  if (changes.silenceTimeoutSeconds !== undefined) patch.silenceTimeoutSeconds = changes.silenceTimeoutSeconds;
+  if (changes.maxDurationSeconds !== undefined) patch.maxDurationSeconds = changes.maxDurationSeconds;
+
+  // Message plan (idle messages)
+  if (changes.messagePlan !== undefined) patch.messagePlan = changes.messagePlan;
+
+  await vapiRequest(`/assistant/${assistantId}`, "PATCH", patch);
+
+  const keys = Object.keys(patch);
+  console.log(`[vapi] Updated assistant ${assistantId}: ${keys.join(", ")}`);
+}
+
+// Convenience wrapper kept for backward compat
+export async function updateAssistantPrompt(
+  assistantId: string,
+  newSystemPrompt: string
+): Promise<void> {
+  await updateAssistant(assistantId, { systemMessage: newSystemPrompt });
+}
+
 export async function createAssistant(
   name: string,
   systemPrompt: string,
@@ -41,7 +113,8 @@ export async function createAssistant(
     },
     voice: {
       provider: "11labs",
-      voiceId: "21m00Tcm4TlvDq8ikWAM",
+      voiceId: "kdmDKE6EkgrWrrykO9Qt",
+      model: "eleven_turbo_v2_5",
     },
     serverUrl,
     firstMessage:
@@ -53,29 +126,6 @@ export async function createAssistant(
   };
   console.log(`[vapi] Created assistant "${name}" → ${result.id}`);
   return result.id;
-}
-
-export async function getAssistant(
-  assistantId: string
-): Promise<{ systemMessage: string; [key: string]: unknown }> {
-  const result = (await vapiRequest(
-    `/assistant/${assistantId}`,
-    "GET"
-  )) as Record<string, unknown>;
-  const model = result.model as { systemMessage?: string } | undefined;
-  return { ...result, systemMessage: model?.systemMessage || "" };
-}
-
-export async function updateAssistantPrompt(
-  assistantId: string,
-  newSystemPrompt: string
-): Promise<void> {
-  await vapiRequest(`/assistant/${assistantId}`, "PATCH", {
-    model: { systemMessage: newSystemPrompt },
-  });
-  console.log(
-    `[vapi] Updated assistant ${assistantId} system prompt (${newSystemPrompt.length} chars)`
-  );
 }
 
 // --- Call management ---
