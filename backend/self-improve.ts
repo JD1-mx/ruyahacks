@@ -8,6 +8,7 @@ import {
 } from "./vapi.js";
 import { notifyOperator } from "./integrations.js";
 import { createAndRegisterTool, getAllTools } from "./tools.js";
+import { createWhatsAppWorkflow, createCustomWorkflow, isN8nConfigured } from "./n8n.js";
 
 const client = new Anthropic();
 
@@ -80,17 +81,15 @@ You can modify ANY of these assistant parameters. Each one fixes specific failur
 
 const TOOL_CREATION_HINTS = `
 TOOL CREATION — You are a self-improving agent. If the conversation failed because you lacked
-a capability (e.g., couldn't send a WhatsApp message, couldn't look up data, couldn't trigger
-a workflow), you should CREATE the missing tool.
+a capability, you MUST create it. That is your entire purpose.
 
-You have access to these integration platforms to build tools:
-- Vapi: For voice-related tools. Tools you create here become available in future calls.
-  Your server exposes tool handlers at the /vapi/tool-calls webhook.
-- n8n: For workflow orchestration — email sending, webhook triggers, multi-step automations.
-  You can trigger n8n workflows via HTTP webhooks.
-- Whapi: For WhatsApp messaging. You can send messages to customers or operators.
+You have TWO ways to create capabilities:
 
-When you identify a missing tool, provide a full spec:
+== 1. VAPI TOOLS (for things the voice assistant calls during a conversation) ==
+These are functions the assistant can invoke mid-call. You create them as tool specs,
+and they get registered on both our server AND on Vapi so the assistant can use them.
+
+Tool spec format:
 {
   "name": "snake_case_tool_name",
   "description": "What it does",
@@ -99,14 +98,48 @@ When you identify a missing tool, provide a full spec:
     "properties": { "param": { "type": "string", "description": "..." } },
     "required": ["param"]
   },
-  "handlerCode": "JS code that runs in async context with access to ctx.sendWhatsApp(phone, msg), ctx.notifyOperator(msg), ctx.triggerN8nWorkflow(data), ctx.fetch(url, opts). MUST return a string."
+  "handlerCode": "JS code with access to ctx.sendWhatsApp(phone, msg), ctx.notifyOperator(msg), ctx.triggerN8nWorkflow(data), ctx.fetch(url, opts). MUST return a string."
 }
 
-If you need an API key or credential you don't have, flag it as a "resourceRequest" — the system
-will ask the operator via WhatsApp to provide it.
+== 2. N8N WORKFLOWS (for multi-step automations the tools trigger) ==
+If you need a WhatsApp messaging workflow, an email workflow, or any multi-step automation,
+you can create it as an n8n workflow. The system will deploy it to n8n and give you a webhook URL.
 
-IMPORTANT: Don't be afraid to create tools. That IS the point. If you see the caller needed
-something and no tool existed for it, BUILD IT.
+n8n workflow spec format:
+{
+  "type": "whatsapp",
+  "name": "Workflow Name",
+  "webhookPath": "unique-path-name"
+}
+
+Or for custom multi-step workflows:
+{
+  "type": "custom",
+  "name": "Workflow Name",
+  "webhookPath": "unique-path-name",
+  "steps": [
+    {
+      "name": "Step Name",
+      "method": "POST",
+      "url": "https://api.example.com/endpoint",
+      "headers": { "Authorization": "Bearer token" },
+      "bodyTemplate": "={ \\"key\\": \\"{{ $json.body.value }}\\" }"
+    }
+  ]
+}
+
+The workflow will be created, activated, and its webhook URL returned. You can then create
+a Vapi tool whose handlerCode calls this webhook URL.
+
+== STRATEGY ==
+For WhatsApp: Create an n8n WhatsApp workflow FIRST, then create a Vapi tool that triggers it.
+For email: Create an n8n email workflow, then a Vapi tool for it.
+For data lookups: Create a Vapi tool directly with ctx.fetch().
+
+If you need an API key or credential you don't have, add it to "resourceRequests" — the system
+will ask the operator via WhatsApp.
+
+IMPORTANT: Don't be afraid to create tools and workflows. That IS the point.
 `;
 
 // --- Core: Full self-improvement pipeline ---
@@ -167,6 +200,40 @@ export async function analyzeAndImprove(
     }
   }
 
+  // 3b. Create n8n workflows
+  const workflowsCreated: { name: string; webhookUrl: string }[] = [];
+  if (analysis.newWorkflows?.length && isN8nConfigured()) {
+    for (const wf of analysis.newWorkflows) {
+      try {
+        console.log(`[self-improve] Creating n8n workflow: "${wf.name}" (${wf.type})`);
+        let result;
+        if (wf.type === "whatsapp") {
+          result = await createWhatsAppWorkflow({
+            name: wf.name,
+            webhookPath: wf.webhookPath,
+            whapiToken: process.env.WHAPI_TOKEN || "",
+          });
+        } else if (wf.type === "custom" && wf.steps) {
+          result = await createCustomWorkflow({
+            name: wf.name,
+            webhookPath: wf.webhookPath,
+            steps: wf.steps,
+          });
+        }
+        if (result) {
+          workflowsCreated.push({ name: wf.name, webhookUrl: result.webhookUrl });
+          console.log(`[self-improve] ✅ Workflow "${wf.name}" deployed: ${result.webhookUrl}`);
+        }
+      } catch (err) {
+        console.error(`[self-improve] Failed to create workflow "${wf.name}":`, err);
+      }
+    }
+  } else if (analysis.newWorkflows?.length && !isN8nConfigured()) {
+    console.warn(`[self-improve] n8n not configured — skipping workflow creation`);
+    analysis.resourceRequests = analysis.resourceRequests || [];
+    analysis.resourceRequests.push("Need N8N_API_URL and N8N_API_KEY to create workflows programmatically");
+  }
+
   // 4. Request missing resources from operator
   if (analysis.resourceRequests?.length) {
     for (const req of analysis.resourceRequests) {
@@ -200,6 +267,7 @@ export async function analyzeAndImprove(
   analysis.failures.forEach((f) => console.log(`   ❌ ${f}`));
   analysis.changes.forEach((c) => console.log(`   ✅ ${c}`));
   toolsCreated.forEach((t) => console.log(`   🔧 Tool created: ${t}`));
+  workflowsCreated.forEach((w) => console.log(`   ⚡ Workflow deployed: ${w.name} → ${w.webhookUrl}`));
 
   await notifyOperator(
     [
@@ -212,6 +280,9 @@ export async function analyzeAndImprove(
       ...analysis.changes.map((c) => `  ✅ ${c}`),
       ...(toolsCreated.length
         ? [``, `Tools created:`, ...toolsCreated.map((t) => `  🔧 ${t}`)]
+        : []),
+      ...(workflowsCreated.length
+        ? [``, `Workflows deployed:`, ...workflowsCreated.map((w) => `  ⚡ ${w.name}: ${w.webhookUrl}`)]
         : []),
       ``,
       customerNumber
@@ -261,6 +332,18 @@ interface AnalysisResult {
       required?: string[];
     };
     handlerCode: string;
+  }[];
+  newWorkflows?: {
+    type: "whatsapp" | "custom";
+    name: string;
+    webhookPath: string;
+    steps?: {
+      name: string;
+      method: string;
+      url: string;
+      headers?: Record<string, string>;
+      bodyTemplate: string;
+    }[];
   }[];
   resourceRequests?: string[];
 }
@@ -330,14 +413,22 @@ Respond with ONLY valid JSON:
       "handlerCode": "return 'result'"
     }
   ],
+  "newWorkflows": [
+    {
+      "type": "whatsapp",
+      "name": "Send Customer WhatsApp",
+      "webhookPath": "send-customer-whatsapp"
+    }
+  ],
   "resourceRequests": [
-    "Need Whapi API key to send WhatsApp messages to customers",
-    "Need n8n webhook URL to trigger email workflows"
+    "Need Whapi token to send WhatsApp messages",
+    "Need n8n API key to create workflows"
   ]
 }
 
 Only include configChanges fields that need changing. Always include systemMessage.
 Only include newTools if tools are actually missing.
+Only include newWorkflows if multi-step automations are needed (WhatsApp, email, etc).
 Only include resourceRequests if you truly need credentials you don't have access to.`,
     messages: [
       {
