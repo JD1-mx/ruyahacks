@@ -263,6 +263,27 @@ app.get("/health", (_req, res) => {
   });
 });
 
+// --- Detailed improvement log (full AI reasoning + pipeline steps) ---
+
+app.get("/improvements/log", (_req, res) => {
+  const improvements = getImprovementHistory();
+  res.json({
+    count: improvements.length,
+    improvements: improvements.map((r) => ({
+      callId: r.callId,
+      customerNumber: r.customerNumber,
+      timestamp: r.timestamp,
+      failures: r.failures,
+      changes: r.changes,
+      toolsCreated: r.toolsCreated,
+      workflowsCreated: r.workflowsCreated,
+      callbackTriggered: r.callbackTriggered,
+      rawAnalysis: r.rawAnalysis,
+      pipelineLog: r.pipelineLog,
+    })),
+  });
+});
+
 // --- Current prompt ---
 
 app.get("/prompt", async (_req, res) => {

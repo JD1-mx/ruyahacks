@@ -13,21 +13,23 @@ export async function GET(req: NextRequest) {
   const callId = req.nextUrl.searchParams.get("callId");
 
   try {
-    const res = await fetch(`${backendUrl}/health`, {
-      headers: { "Content-Type": "application/json" },
-    });
+    // Fetch detailed improvement log (includes rawAnalysis + pipelineLog)
+    const [logRes, healthRes] = await Promise.all([
+      fetch(`${backendUrl}/improvements/log`, {
+        headers: { "Content-Type": "application/json" },
+      }),
+      fetch(`${backendUrl}/health`, {
+        headers: { "Content-Type": "application/json" },
+      }),
+    ]);
 
-    if (!res.ok) {
-      return NextResponse.json(
-        { improvements: [], dynamicTools: [] },
-        { status: 200 },
-      );
-    }
+    const logData = logRes.ok ? await logRes.json() : { improvements: [] };
+    const healthData = healthRes.ok ? await healthRes.json() : { tools: [] };
 
-    const data = await res.json();
-
-    let improvements = data.improvements || [];
-    const dynamicTools = data.dynamicTools || [];
+    let improvements = logData.improvements || [];
+    const dynamicTools = (healthData.tools || []).filter(
+      (t: { isDynamic?: boolean }) => t.isDynamic,
+    );
 
     if (callId) {
       improvements = improvements.filter(

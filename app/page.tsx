@@ -49,11 +49,21 @@ interface CallData {
   costs: Array<{ type: string; amount: number }> | null;
 }
 
+interface PipelineStep {
+  step: string;
+  status: "ok" | "error" | "skipped";
+  detail: string;
+  timestamp: string;
+}
+
 interface Improvement {
   callId?: string;
   failures?: string[];
   changes?: string[];
-  toolsCreated?: Array<{ name: string; description: string }>;
+  toolsCreated?: string[];
+  workflowsCreated?: string[];
+  rawAnalysis?: string;
+  pipelineLog?: PipelineStep[];
 }
 
 const DEFAULT_SCENARIO = {
@@ -636,38 +646,140 @@ export default function DemoPage() {
             {/* Self-Improvement Results */}
             <div className="border-divide rounded-xl border p-6 dark:border-neutral-700">
               <h3 className="mb-4 font-semibold">
-                Self-Improvement Results
+                Self-Improvement Engine
               </h3>
               {improvementsLoading ? (
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
                   <Loader2 className="size-4 animate-spin" />
-                  Agent is analyzing the call...
+                  Agent is analyzing the call and improving itself...
                 </div>
               ) : improvements.length > 0 || dynamicTools.length > 0 ? (
-                <div className="space-y-3">
+                <div className="space-y-4">
                   {improvements.map((imp, idx) => (
-                    <div key={idx} className="space-y-2">
-                      {imp.failures?.map((f, i) => (
-                        <div
-                          key={`f-${i}`}
-                          className="flex items-center gap-2 text-sm"
-                        >
-                          <XCircle className="size-4 shrink-0 text-red-500" />
-                          <span>{f}</span>
+                    <div key={idx} className="space-y-4">
+                      {/* Pipeline Log */}
+                      {imp.pipelineLog && imp.pipelineLog.length > 0 && (
+                        <div>
+                          <h4 className="mb-2 text-sm font-medium text-muted-foreground">
+                            Pipeline Steps
+                          </h4>
+                          <div className="space-y-1 rounded-lg bg-gray-50 p-3 dark:bg-neutral-900">
+                            {imp.pipelineLog.map((step, i) => (
+                              <div
+                                key={i}
+                                className="flex items-start gap-2 font-mono text-xs"
+                              >
+                                <span className="shrink-0 pt-0.5">
+                                  {step.status === "ok"
+                                    ? "✅"
+                                    : step.status === "error"
+                                      ? "❌"
+                                      : "⏭️"}
+                                </span>
+                                <span className="text-muted-foreground">
+                                  [{step.step}]
+                                </span>
+                                <span className="break-all">{step.detail}</span>
+                              </div>
+                            ))}
+                          </div>
                         </div>
-                      ))}
-                      {imp.changes?.map((c, i) => (
-                        <div
-                          key={`c-${i}`}
-                          className="flex items-center gap-2 text-sm"
-                        >
-                          <CheckCircle2 className="size-4 shrink-0 text-green-500" />
-                          <span>{c}</span>
+                      )}
+
+                      {/* Failures */}
+                      {imp.failures && imp.failures.length > 0 && (
+                        <div>
+                          <h4 className="mb-2 text-sm font-medium text-red-600 dark:text-red-400">
+                            Failures Identified
+                          </h4>
+                          <div className="space-y-1.5">
+                            {imp.failures.map((f, i) => (
+                              <div
+                                key={`f-${i}`}
+                                className="flex items-start gap-2 text-sm"
+                              >
+                                <XCircle className="mt-0.5 size-4 shrink-0 text-red-500" />
+                                <span>{f}</span>
+                              </div>
+                            ))}
+                          </div>
                         </div>
-                      ))}
-                      {imp.toolsCreated?.map((t, i) => (
+                      )}
+
+                      {/* Changes Applied */}
+                      {imp.changes && imp.changes.length > 0 && (
+                        <div>
+                          <h4 className="mb-2 text-sm font-medium text-green-600 dark:text-green-400">
+                            Changes Applied
+                          </h4>
+                          <div className="space-y-1.5">
+                            {imp.changes.map((c, i) => (
+                              <div
+                                key={`c-${i}`}
+                                className="flex items-start gap-2 text-sm"
+                              >
+                                <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-green-500" />
+                                <span>{c}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Tools Created */}
+                      {imp.toolsCreated && imp.toolsCreated.length > 0 && (
+                        <div>
+                          <h4 className="mb-2 text-sm font-medium text-brand">
+                            Tools Created
+                          </h4>
+                          <div className="space-y-1.5">
+                            {imp.toolsCreated.map((t, i) => (
+                              <div
+                                key={`t-${i}`}
+                                className="flex items-center gap-2 text-sm"
+                              >
+                                <Wrench className="size-4 shrink-0 text-brand" />
+                                <span className="font-medium">{t}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Workflows Created */}
+                      {imp.workflowsCreated &&
+                        imp.workflowsCreated.length > 0 && (
+                          <div>
+                            <h4 className="mb-2 text-sm font-medium text-purple-600 dark:text-purple-400">
+                              n8n Workflows Deployed
+                            </h4>
+                            <div className="space-y-1.5">
+                              {imp.workflowsCreated.map((w, i) => (
+                                <div
+                                  key={`w-${i}`}
+                                  className="flex items-center gap-2 text-sm"
+                                >
+                                  <CheckCircle2 className="size-4 shrink-0 text-purple-500" />
+                                  <span className="font-mono text-xs break-all">
+                                    {w}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                    </div>
+                  ))}
+
+                  {/* Dynamic tools from health */}
+                  {dynamicTools.length > 0 && (
+                    <div>
+                      <h4 className="mb-2 text-sm font-medium text-muted-foreground">
+                        Active Dynamic Tools
+                      </h4>
+                      {dynamicTools.map((t, i) => (
                         <div
-                          key={`t-${i}`}
+                          key={`dt-${i}`}
                           className="flex items-center gap-2 text-sm"
                         >
                           <Wrench className="size-4 shrink-0 text-brand" />
@@ -678,23 +790,12 @@ export default function DemoPage() {
                         </div>
                       ))}
                     </div>
-                  ))}
-                  {dynamicTools.map((t, i) => (
-                    <div
-                      key={`dt-${i}`}
-                      className="flex items-center gap-2 text-sm"
-                    >
-                      <Wrench className="size-4 shrink-0 text-brand" />
-                      <span>
-                        <span className="font-medium">{t.name}</span>{" "}
-                        &mdash; {t.description}
-                      </span>
-                    </div>
-                  ))}
+                  )}
                 </div>
               ) : (
                 <p className="text-sm text-muted-foreground">
-                  No improvements triggered for this call.
+                  No improvements triggered for this call yet. The agent
+                  analyzes each call after it ends and self-improves.
                 </p>
               )}
             </div>

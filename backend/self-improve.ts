@@ -14,6 +14,13 @@ const client = new Anthropic();
 
 // --- Improvement history (in-memory) ---
 
+export interface PipelineStep {
+  step: string;
+  status: "ok" | "error" | "skipped";
+  detail: string;
+  timestamp: string;
+}
+
 export interface ImprovementRecord {
   callId: string;
   customerNumber?: string;
@@ -21,9 +28,12 @@ export interface ImprovementRecord {
   failures: string[];
   changes: string[];
   toolsCreated: string[];
+  workflowsCreated: string[];
   configBefore: Record<string, unknown>;
   configAfter: AssistantConfig;
   callbackTriggered: boolean;
+  rawAnalysis?: string;
+  pipelineLog: PipelineStep[];
 }
 
 const history: ImprovementRecord[] = [];
@@ -132,87 +142,112 @@ IMPORTANT: Don't be afraid to create tools and workflows. Figure it out. That IS
 
 // --- Core: Full self-improvement pipeline ---
 
+function logStep(log: PipelineStep[], step: string, status: PipelineStep["status"], detail: string) {
+  const entry: PipelineStep = { step, status, detail, timestamp: new Date().toISOString() };
+  log.push(entry);
+  const icon = status === "ok" ? "✅" : status === "error" ? "❌" : "⏭️";
+  console.log(`[self-improve] ${icon} ${step}: ${detail}`);
+}
+
 export async function analyzeAndImprove(
   callId: string,
   assistantId: string,
   customerNumber?: string
 ): Promise<ImprovementRecord> {
+  const log: PipelineStep[] = [];
+
   console.log(`\n[self-improve] ===================================`);
   console.log(`[self-improve]   SELF-IMPROVEMENT PIPELINE START`);
+  console.log(`[self-improve]   Call: ${callId}`);
+  console.log(`[self-improve]   Customer: ${customerNumber || "unknown"}`);
   console.log(`[self-improve] ===================================`);
-  console.log(`[self-improve] Call: ${callId}`);
-  console.log(`[self-improve] Customer: ${customerNumber || "unknown"}`);
 
-  // 1. Get transcript + current config
-  const call = await getCall(callId);
-  console.log(`[self-improve] Status: ${call.status}, ended: ${call.endedReason}`);
-  console.log(`[self-improve] Transcript: ${call.transcript?.length || 0} chars`);
+  // 1. Fetch transcript + current config
+  logStep(log, "fetch_transcript", "ok", `Fetching call ${callId} from Vapi...`);
+  let call;
+  try {
+    call = await getCall(callId);
+    logStep(log, "fetch_transcript", "ok", `Got transcript (${call.transcript?.length || 0} chars), status=${call.status}, ended=${call.endedReason}`);
+  } catch (err) {
+    logStep(log, "fetch_transcript", "error", `Failed to fetch call: ${(err as Error).message}`);
+    throw err;
+  }
 
+  logStep(log, "fetch_assistant", "ok", "Fetching current assistant config...");
   const assistant = await getAssistant(assistantId);
+  logStep(log, "fetch_assistant", "ok", `Current prompt: ${assistant.systemMessage.slice(0, 80)}...`);
+
   const existingTools = getAllTools();
+  logStep(log, "check_tools", "ok", `${existingTools.length} existing tools: ${existingTools.map(t => t.name).join(", ") || "none"}`);
 
   // 2. Analyze with Claude
-  const analysis = await analyzeTranscript(
-    call.transcript,
-    assistant.systemMessage,
-    assistant.config,
-    existingTools.map((t) => ({ name: t.name, description: t.description }))
-  );
+  logStep(log, "ai_analysis", "ok", "Sending transcript to Claude for analysis...");
+  let analysis;
+  let rawAnalysisText = "";
+  try {
+    const result = await analyzeTranscriptWithRaw(
+      call.transcript,
+      assistant.systemMessage,
+      assistant.config,
+      existingTools.map((t) => ({ name: t.name, description: t.description }))
+    );
+    analysis = result.parsed;
+    rawAnalysisText = result.raw;
+    logStep(log, "ai_analysis", "ok", `Claude identified ${analysis.failures.length} failures, ${analysis.changes.length} changes, ${analysis.newTools?.length || 0} new tools, ${analysis.newWorkflows?.length || 0} new workflows`);
+  } catch (err) {
+    logStep(log, "ai_analysis", "error", `Claude analysis failed: ${(err as Error).message}`);
+    throw err;
+  }
 
-  // 3. Create and TEST any missing tools
+  // 3. Create tools
   const toolsCreated: string[] = [];
-  const toolTestResults: { name: string; passed: boolean; output: string }[] = [];
   if (analysis.newTools?.length) {
     for (const toolSpec of analysis.newTools) {
       try {
-        console.log(`[self-improve] Creating tool: "${toolSpec.name}"`);
+        logStep(log, "create_tool", "ok", `Creating tool: "${toolSpec.name}" — ${toolSpec.description}`);
         const tool = await createAndRegisterTool(toolSpec);
         toolsCreated.push(toolSpec.name);
 
-        // Smoke test: call the tool with empty/default args to verify it doesn't crash
         try {
           const testArgs: Record<string, unknown> = {};
           for (const [key, prop] of Object.entries(toolSpec.parameters.properties)) {
             testArgs[key] = prop.type === "string" ? "test" : 0;
           }
           const output = await tool.handler(testArgs);
-          toolTestResults.push({ name: toolSpec.name, passed: true, output });
-          console.log(`[self-improve] ✅ Tool "${toolSpec.name}" test PASSED: ${output.slice(0, 100)}`);
+          logStep(log, "test_tool", "ok", `Tool "${toolSpec.name}" smoke test passed: ${output.slice(0, 100)}`);
         } catch (testErr) {
-          toolTestResults.push({ name: toolSpec.name, passed: false, output: (testErr as Error).message });
-          console.error(`[self-improve] ⚠️ Tool "${toolSpec.name}" test FAILED:`, testErr);
+          logStep(log, "test_tool", "error", `Tool "${toolSpec.name}" smoke test failed: ${(testErr as Error).message}`);
         }
       } catch (err) {
-        console.error(`[self-improve] Failed to create tool "${toolSpec.name}":`, err);
+        logStep(log, "create_tool", "error", `Failed to create tool "${toolSpec.name}": ${(err as Error).message}`);
       }
     }
+  } else {
+    logStep(log, "create_tool", "skipped", "No new tools requested by analysis");
   }
 
-  // 3b. Create n8n workflows → then create Vapi tools pointing to their webhook URLs
-  const workflowsCreated: { name: string; webhookUrl: string }[] = [];
+  // 4. Create n8n workflows
+  const workflowsCreated: string[] = [];
   if (analysis.newWorkflows?.length && isN8nConfigured()) {
     for (const wf of analysis.newWorkflows) {
       try {
-        console.log(`[self-improve] Creating n8n workflow: "${wf.name}"`);
         if (!wf.steps?.length) {
-          console.warn(`[self-improve] Workflow "${wf.name}" has no steps — skipping`);
+          logStep(log, "create_workflow", "skipped", `Workflow "${wf.name}" has no steps`);
           continue;
         }
 
+        logStep(log, "create_workflow", "ok", `Creating n8n workflow: "${wf.name}" (${wf.steps.length} steps)`);
         const result = await createCustomWorkflow({
           name: wf.name,
           webhookPath: wf.webhookPath,
           steps: wf.steps,
         });
-        workflowsCreated.push({ name: wf.name, webhookUrl: result.webhookUrl });
-        console.log(`[self-improve] ✅ Workflow "${wf.name}" deployed: ${result.webhookUrl}`);
+        workflowsCreated.push(`${wf.name} → ${result.webhookUrl}`);
+        logStep(log, "create_workflow", "ok", `Workflow "${wf.name}" deployed: ${result.webhookUrl}`);
 
-        // Now create a Vapi tool that calls this n8n production webhook URL
-        // and attach it to the assistant so it's available in voice calls
+        // Create Vapi tool pointing to n8n webhook
         const toolName = wf.webhookPath.replace(/-/g, "_");
-        const webhookUrl = result.webhookUrl;
-        console.log(`[self-improve] Creating Vapi tool "${toolName}" → ${webhookUrl}`);
-
+        logStep(log, "wire_workflow_to_vapi", "ok", `Creating Vapi tool "${toolName}" → ${result.webhookUrl}`);
         await createAndRegisterTool({
           name: toolName,
           description: `${wf.name} — triggers n8n workflow via webhook`,
@@ -224,35 +259,40 @@ export async function analyzeAndImprove(
             },
             required: ["to", "message"],
           },
-          handlerCode: `const res = await ctx.fetch("${webhookUrl}", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to: args.to, message: args.message }) }); const data = await res.json(); return JSON.stringify(data);`,
+          handlerCode: `const res = await ctx.fetch("${result.webhookUrl}", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to: args.to, message: args.message }) }); const data = await res.json(); return JSON.stringify(data);`,
         });
         toolsCreated.push(toolName);
-        console.log(`[self-improve] ✅ Vapi tool "${toolName}" created and attached to assistant`);
-
+        logStep(log, "wire_workflow_to_vapi", "ok", `Vapi tool "${toolName}" created and attached to assistant`);
       } catch (err) {
-        console.error(`[self-improve] Failed to create workflow "${wf.name}":`, err);
+        logStep(log, "create_workflow", "error", `Failed: "${wf.name}": ${(err as Error).message}`);
       }
     }
-  } else if (analysis.newWorkflows?.length && !isN8nConfigured()) {
-    console.warn(`[self-improve] n8n not configured — skipping workflow creation`);
+  } else if (analysis.newWorkflows?.length) {
+    logStep(log, "create_workflow", "error", "n8n not configured (N8N_API_URL or N8N_API_KEY missing) — cannot create workflows");
     analysis.resourceRequests = analysis.resourceRequests || [];
     analysis.resourceRequests.push("Need N8N_API_URL and N8N_API_KEY to create workflows programmatically");
+  } else {
+    logStep(log, "create_workflow", "skipped", "No new workflows requested by analysis");
   }
 
-  // 4. Request missing resources from operator
+  // 5. Resource requests
   if (analysis.resourceRequests?.length) {
     for (const req of analysis.resourceRequests) {
-      await notifyOperator(
-        `🔑 RESOURCE REQUEST: ${req}\n\nI identified this as needed to handle future calls. Please provide it or reply with instructions.`
-      );
-      console.log(`[self-improve] Requested resource: ${req}`);
+      await notifyOperator(`🔑 RESOURCE REQUEST: ${req}`);
+      logStep(log, "resource_request", "ok", req);
     }
   }
 
-  // 5. Update assistant config + prompt
-  await updateAssistant(assistantId, analysis.configChanges);
+  // 6. Update assistant
+  logStep(log, "update_assistant", "ok", "Applying config changes to Vapi assistant...");
+  try {
+    await updateAssistant(assistantId, analysis.configChanges);
+    logStep(log, "update_assistant", "ok", `Updated: ${Object.keys(analysis.configChanges).join(", ")}`);
+  } catch (err) {
+    logStep(log, "update_assistant", "error", `Failed to update assistant: ${(err as Error).message}`);
+  }
 
-  // 6. Log it
+  // 7. Record
   const record: ImprovementRecord = {
     callId,
     customerNumber,
@@ -260,66 +300,46 @@ export async function analyzeAndImprove(
     failures: analysis.failures,
     changes: analysis.changes,
     toolsCreated,
+    workflowsCreated,
     configBefore: assistant.config,
     configAfter: analysis.configChanges,
     callbackTriggered: false,
+    rawAnalysis: rawAnalysisText,
+    pipelineLog: log,
   };
-
   history.push(record);
 
-  // 7. Notify operator
-  console.log(`[self-improve] --- Results ---`);
-  analysis.failures.forEach((f) => console.log(`   ❌ ${f}`));
-  analysis.changes.forEach((c) => console.log(`   ✅ ${c}`));
-  toolsCreated.forEach((t) => console.log(`   🔧 Tool created: ${t}`));
-  workflowsCreated.forEach((w) => console.log(`   ⚡ Workflow deployed: ${w.name} → ${w.webhookUrl}`));
-
+  // 8. Notify operator
   await notifyOperator(
     [
       `🧠 Self-improvement complete (call ${callId})`,
       ``,
-      `Failures found:`,
-      ...analysis.failures.map((f) => `  ❌ ${f}`),
-      ``,
-      `Changes applied:`,
-      ...analysis.changes.map((c) => `  ✅ ${c}`),
-      ...(toolsCreated.length
-        ? [``, `Tools created:`, ...toolsCreated.map((t) => `  🔧 ${t}`)]
-        : []),
-      ...(workflowsCreated.length
-        ? [``, `Workflows deployed:`, ...workflowsCreated.map((w) => `  ⚡ ${w.name}: ${w.webhookUrl}`)]
-        : []),
-      ``,
-      customerNumber
-        ? `Calling customer back now...`
-        : `No customer number — skipping callback.`,
+      `Failures: ${analysis.failures.map(f => `❌ ${f}`).join("\n")}`,
+      `Changes: ${analysis.changes.map(c => `✅ ${c}`).join("\n")}`,
+      ...(toolsCreated.length ? [`Tools: ${toolsCreated.join(", ")}`] : []),
+      ...(workflowsCreated.length ? [`Workflows: ${workflowsCreated.join(", ")}`] : []),
+      customerNumber ? `Calling customer back...` : `No customer number — skipping callback.`,
     ].join("\n")
   );
 
-  // 8. Auto-callback to customer with improved agent
+  // 9. Auto-callback
   if (customerNumber) {
-    console.log(`[self-improve] Triggering callback to ${customerNumber}...`);
-
-    // Brief delay so Vapi assistant config propagates
+    logStep(log, "callback", "ok", `Triggering callback to ${customerNumber}...`);
     await new Promise((resolve) => setTimeout(resolve, 3000));
-
     try {
       const phoneNumberId = process.env.VAPI_PHONE_NUMBER_ID;
       const callbackId = await createOutboundCall(assistantId, customerNumber, phoneNumberId);
       record.callbackTriggered = true;
-      console.log(`[self-improve] Callback initiated: ${callbackId}`);
+      logStep(log, "callback", "ok", `Callback initiated: ${callbackId}`);
     } catch (err) {
-      console.error(`[self-improve] Callback failed:`, err);
-      await notifyOperator(
-        `⚠️ Failed to call customer back at ${customerNumber}: ${(err as Error).message}`
-      );
+      logStep(log, "callback", "error", `Callback failed: ${(err as Error).message}`);
+      await notifyOperator(`⚠️ Failed to call customer back at ${customerNumber}: ${(err as Error).message}`);
     }
+  } else {
+    logStep(log, "callback", "skipped", "No customer number available");
   }
 
-  console.log(`[self-improve] ===================================`);
-  console.log(`[self-improve]   PIPELINE COMPLETE`);
-  console.log(`[self-improve] ===================================\n`);
-
+  console.log(`[self-improve] ===== PIPELINE COMPLETE (${log.length} steps) =====\n`);
   return record;
 }
 
@@ -354,12 +374,12 @@ interface AnalysisResult {
   resourceRequests?: string[];
 }
 
-async function analyzeTranscript(
+async function analyzeTranscriptWithRaw(
   transcript: string,
   currentPrompt: string,
   currentConfig: Record<string, unknown>,
   existingTools: { name: string; description: string }[]
-): Promise<AnalysisResult> {
+): Promise<{ parsed: AnalysisResult; raw: string }> {
   const toolList = existingTools.length
     ? existingTools.map((t) => `- ${t.name}: ${t.description}`).join("\n")
     : "NO TOOLS CONFIGURED";
@@ -489,14 +509,19 @@ Only include resourceRequests if you truly need credentials you don't have acces
     response.content[0].type === "text" ? response.content[0].text : "";
   const cleaned = text.replace(/```json?\n?/g, "").replace(/```/g, "").trim();
 
+  console.log(`[self-improve] Raw Claude response (${text.length} chars)`);
+
   try {
-    return JSON.parse(cleaned);
+    return { parsed: JSON.parse(cleaned), raw: text };
   } catch {
     console.error("[self-improve] Failed to parse analysis:", text);
     return {
-      failures: ["Could not parse analysis output"],
-      changes: ["No changes made — parse error"],
-      configChanges: { systemMessage: currentPrompt },
+      parsed: {
+        failures: ["Could not parse analysis output"],
+        changes: ["No changes made — parse error"],
+        configChanges: { systemMessage: currentPrompt },
+      },
+      raw: text,
     };
   }
 }
@@ -513,7 +538,7 @@ export async function analyzeFromTranscript(
   const assistant = await getAssistant(assistantId);
   const existingTools = getAllTools();
 
-  const analysis = await analyzeTranscript(
+  const { parsed: analysis, raw: rawAnalysisText } = await analyzeTranscriptWithRaw(
     transcript,
     assistant.systemMessage,
     assistant.config,
@@ -549,9 +574,12 @@ export async function analyzeFromTranscript(
     failures: analysis.failures,
     changes: analysis.changes,
     toolsCreated,
+    workflowsCreated: [],
     configBefore: assistant.config,
     configAfter: analysis.configChanges,
     callbackTriggered: false,
+    rawAnalysis: rawAnalysisText,
+    pipelineLog: [],
   };
 
   history.push(record);
