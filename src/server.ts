@@ -5,7 +5,7 @@ import type {
   VapiServerMessage,
   WhapiIncomingMessage,
 } from "./types.js";
-import { getTool, getAllTools } from "./tools.js";
+import { getTool, getAllTools, getDynamicTools } from "./tools.js";
 import { decide } from "./brain.js";
 import { sendWhatsApp } from "./integrations.js";
 import {
@@ -14,6 +14,7 @@ import {
   getImprovementHistory,
 } from "./self-improve.js";
 import { getAssistant, createOutboundCall, getCall } from "./vapi.js";
+import { resetToBaseline, BASELINE } from "./baseline.js";
 
 const app = express();
 app.use(express.json());
@@ -261,6 +262,73 @@ app.get("/prompt", async (_req, res) => {
   }
 });
 
+// --- Reset to baseline ---
+
+app.post("/reset", async (_req, res) => {
+  const assistantId = process.env.VAPI_ASSISTANT_ID;
+  if (!assistantId) {
+    res.status(400).json({ error: "VAPI_ASSISTANT_ID not set" });
+    return;
+  }
+
+  try {
+    await resetToBaseline(assistantId);
+    res.json({
+      ok: true,
+      message: "Reset to baseline. Assistant prompt is weak, tools cleared, history wiped.",
+      baseline: BASELINE,
+    });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+// --- Get baseline config ---
+
+app.get("/baseline", (_req, res) => {
+  res.json({ baseline: BASELINE });
+});
+
+// --- Full state: before vs after comparison ---
+
+app.get("/state", async (_req, res) => {
+  const assistantId = process.env.VAPI_ASSISTANT_ID;
+  if (!assistantId) {
+    res.status(400).json({ error: "VAPI_ASSISTANT_ID not set" });
+    return;
+  }
+
+  try {
+    const assistant = await getAssistant(assistantId);
+    const dynamicTools = getDynamicTools().map((t) => ({
+      name: t.name,
+      description: t.description,
+      createdAt: t.createdAt,
+      params: Object.keys(t.parameters.properties),
+    }));
+    const improvements = getImprovementHistory();
+
+    res.json({
+      baseline: BASELINE,
+      current: {
+        systemMessage: assistant.systemMessage,
+        config: assistant.config,
+      },
+      dynamicToolsCreated: dynamicTools,
+      improvements: improvements.map((r) => ({
+        callId: r.callId,
+        timestamp: r.timestamp,
+        failures: r.failures,
+        changes: r.changes,
+        toolsCreated: r.toolsCreated,
+        callbackTriggered: r.callbackTriggered,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 // --- Test brain ---
 
 app.post("/test/brain", async (req, res) => {
@@ -292,7 +360,10 @@ app.listen(PORT, () => {
   console.log(`  POST /whapi/incoming        — WhatsApp incoming`);
   console.log(`  POST /improve              — Manual self-improvement (callId/transcript)`);
   console.log(`  POST /calls/create         — Create outbound call`);
+  console.log(`  POST /reset                — Reset assistant to weak baseline`);
   console.log(`  GET  /calls/:id            — Get call transcript`);
   console.log(`  GET  /prompt               — View current assistant prompt`);
+  console.log(`  GET  /baseline             — View baseline config`);
+  console.log(`  GET  /state                — Full before/after comparison`);
   console.log(`  GET  /health               — Tools + improvement history\n`);
 });

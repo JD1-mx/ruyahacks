@@ -31,6 +31,10 @@ export function getImprovementHistory(): ImprovementRecord[] {
   return history;
 }
 
+export function clearHistory() {
+  history.length = 0;
+}
+
 // --- The configurable parameters the AI can tune ---
 
 const TUNABLE_PARAMETERS = `
@@ -134,14 +138,29 @@ export async function analyzeAndImprove(
     existingTools.map((t) => ({ name: t.name, description: t.description }))
   );
 
-  // 3. Create any missing tools
+  // 3. Create and TEST any missing tools
   const toolsCreated: string[] = [];
+  const toolTestResults: { name: string; passed: boolean; output: string }[] = [];
   if (analysis.newTools?.length) {
     for (const toolSpec of analysis.newTools) {
       try {
         console.log(`[self-improve] Creating tool: "${toolSpec.name}"`);
-        await createAndRegisterTool(toolSpec);
+        const tool = await createAndRegisterTool(toolSpec);
         toolsCreated.push(toolSpec.name);
+
+        // Smoke test: call the tool with empty/default args to verify it doesn't crash
+        try {
+          const testArgs: Record<string, unknown> = {};
+          for (const [key, prop] of Object.entries(toolSpec.parameters.properties)) {
+            testArgs[key] = prop.type === "string" ? "test" : 0;
+          }
+          const output = await tool.handler(testArgs);
+          toolTestResults.push({ name: toolSpec.name, passed: true, output });
+          console.log(`[self-improve] ✅ Tool "${toolSpec.name}" test PASSED: ${output.slice(0, 100)}`);
+        } catch (testErr) {
+          toolTestResults.push({ name: toolSpec.name, passed: false, output: (testErr as Error).message });
+          console.error(`[self-improve] ⚠️ Tool "${toolSpec.name}" test FAILED:`, testErr);
+        }
       } catch (err) {
         console.error(`[self-improve] Failed to create tool "${toolSpec.name}":`, err);
       }
