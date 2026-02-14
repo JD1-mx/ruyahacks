@@ -3,9 +3,11 @@ import {
   getAssistant,
   updateAssistant,
   getCall,
+  createOutboundCall,
   type AssistantConfig,
 } from "./vapi.js";
 import { notifyOperator } from "./integrations.js";
+import { createAndRegisterTool, getAllTools } from "./tools.js";
 
 const client = new Anthropic();
 
@@ -13,11 +15,14 @@ const client = new Anthropic();
 
 export interface ImprovementRecord {
   callId: string;
+  customerNumber?: string;
   timestamp: string;
   failures: string[];
   changes: string[];
+  toolsCreated: string[];
   configBefore: Record<string, unknown>;
   configAfter: AssistantConfig;
+  callbackTriggered: boolean;
 }
 
 const history: ImprovementRecord[] = [];
@@ -27,7 +32,6 @@ export function getImprovementHistory(): ImprovementRecord[] {
 }
 
 // --- The configurable parameters the AI can tune ---
-// Each maps a Vapi field to what failure it fixes
 
 const TUNABLE_PARAMETERS = `
 You can modify ANY of these assistant parameters. Each one fixes specific failure modes:
@@ -68,91 +72,224 @@ You can modify ANY of these assistant parameters. Each one fixes specific failur
    FIXES: Agent repeating idle messages endlessly. Set to 2-3.
 `;
 
-// --- Core: Analyze transcript + improve ---
+// --- What the AI knows about tool creation ---
+
+const TOOL_CREATION_HINTS = `
+TOOL CREATION — You are a self-improving agent. If the conversation failed because you lacked
+a capability (e.g., couldn't send a WhatsApp message, couldn't look up data, couldn't trigger
+a workflow), you should CREATE the missing tool.
+
+You have access to these integration platforms to build tools:
+- Vapi: For voice-related tools. Tools you create here become available in future calls.
+  Your server exposes tool handlers at the /vapi/tool-calls webhook.
+- n8n: For workflow orchestration — email sending, webhook triggers, multi-step automations.
+  You can trigger n8n workflows via HTTP webhooks.
+- Whapi: For WhatsApp messaging. You can send messages to customers or operators.
+
+When you identify a missing tool, provide a full spec:
+{
+  "name": "snake_case_tool_name",
+  "description": "What it does",
+  "parameters": {
+    "type": "object",
+    "properties": { "param": { "type": "string", "description": "..." } },
+    "required": ["param"]
+  },
+  "handlerCode": "JS code that runs in async context with access to ctx.sendWhatsApp(phone, msg), ctx.notifyOperator(msg), ctx.triggerN8nWorkflow(data), ctx.fetch(url, opts). MUST return a string."
+}
+
+If you need an API key or credential you don't have, flag it as a "resourceRequest" — the system
+will ask the operator via WhatsApp to provide it.
+
+IMPORTANT: Don't be afraid to create tools. That IS the point. If you see the caller needed
+something and no tool existed for it, BUILD IT.
+`;
+
+// --- Core: Full self-improvement pipeline ---
 
 export async function analyzeAndImprove(
   callId: string,
-  assistantId: string
+  assistantId: string,
+  customerNumber?: string
 ): Promise<ImprovementRecord> {
-  console.log(`\n[self-improve] ===== SELF-IMPROVEMENT TRIGGERED =====`);
-  console.log(`[self-improve] Analyzing call ${callId}...`);
+  console.log(`\n[self-improve] ===================================`);
+  console.log(`[self-improve]   SELF-IMPROVEMENT PIPELINE START`);
+  console.log(`[self-improve] ===================================`);
+  console.log(`[self-improve] Call: ${callId}`);
+  console.log(`[self-improve] Customer: ${customerNumber || "unknown"}`);
 
+  // 1. Get transcript + current config
   const call = await getCall(callId);
-  console.log(`[self-improve] Call status: ${call.status}, ended: ${call.endedReason}`);
-  console.log(`[self-improve] Transcript length: ${call.transcript?.length || 0} chars`);
+  console.log(`[self-improve] Status: ${call.status}, ended: ${call.endedReason}`);
+  console.log(`[self-improve] Transcript: ${call.transcript?.length || 0} chars`);
 
   const assistant = await getAssistant(assistantId);
+  const existingTools = getAllTools();
 
+  // 2. Analyze with Claude
   const analysis = await analyzeTranscript(
     call.transcript,
     assistant.systemMessage,
-    assistant.config
+    assistant.config,
+    existingTools.map((t) => ({ name: t.name, description: t.description }))
   );
 
+  // 3. Create any missing tools
+  const toolsCreated: string[] = [];
+  if (analysis.newTools?.length) {
+    for (const toolSpec of analysis.newTools) {
+      try {
+        console.log(`[self-improve] Creating tool: "${toolSpec.name}"`);
+        await createAndRegisterTool(toolSpec);
+        toolsCreated.push(toolSpec.name);
+      } catch (err) {
+        console.error(`[self-improve] Failed to create tool "${toolSpec.name}":`, err);
+      }
+    }
+  }
+
+  // 4. Request missing resources from operator
+  if (analysis.resourceRequests?.length) {
+    for (const req of analysis.resourceRequests) {
+      await notifyOperator(
+        `🔑 RESOURCE REQUEST: ${req}\n\nI identified this as needed to handle future calls. Please provide it or reply with instructions.`
+      );
+      console.log(`[self-improve] Requested resource: ${req}`);
+    }
+  }
+
+  // 5. Update assistant config + prompt
   await updateAssistant(assistantId, analysis.configChanges);
 
+  // 6. Log it
   const record: ImprovementRecord = {
     callId,
+    customerNumber,
     timestamp: new Date().toISOString(),
     failures: analysis.failures,
     changes: analysis.changes,
+    toolsCreated,
     configBefore: assistant.config,
     configAfter: analysis.configChanges,
+    callbackTriggered: false,
   };
 
   history.push(record);
 
-  console.log(`[self-improve] Failures identified:`);
+  // 7. Notify operator
+  console.log(`[self-improve] --- Results ---`);
   analysis.failures.forEach((f) => console.log(`   ❌ ${f}`));
-  console.log(`[self-improve] Changes applied:`);
   analysis.changes.forEach((c) => console.log(`   ✅ ${c}`));
-  console.log(`[self-improve] Config keys updated: ${Object.keys(analysis.configChanges).join(", ")}`);
-  console.log(`[self-improve] ===== IMPROVEMENT COMPLETE =====\n`);
+  toolsCreated.forEach((t) => console.log(`   🔧 Tool created: ${t}`));
 
   await notifyOperator(
-    `Self-improvement after call ${callId}:\n\nFailures:\n${analysis.failures.map((f) => `• ${f}`).join("\n")}\n\nChanges:\n${analysis.changes.map((c) => `• ${c}`).join("\n")}`
+    [
+      `🧠 Self-improvement complete (call ${callId})`,
+      ``,
+      `Failures found:`,
+      ...analysis.failures.map((f) => `  ❌ ${f}`),
+      ``,
+      `Changes applied:`,
+      ...analysis.changes.map((c) => `  ✅ ${c}`),
+      ...(toolsCreated.length
+        ? [``, `Tools created:`, ...toolsCreated.map((t) => `  🔧 ${t}`)]
+        : []),
+      ``,
+      customerNumber
+        ? `Calling customer back now...`
+        : `No customer number — skipping callback.`,
+    ].join("\n")
   );
 
+  // 8. Auto-callback to customer with improved agent
+  if (customerNumber) {
+    console.log(`[self-improve] Triggering callback to ${customerNumber}...`);
+
+    // Brief delay so Vapi assistant config propagates
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    try {
+      const callbackId = await createOutboundCall(assistantId, customerNumber);
+      record.callbackTriggered = true;
+      console.log(`[self-improve] Callback initiated: ${callbackId}`);
+    } catch (err) {
+      console.error(`[self-improve] Callback failed:`, err);
+      await notifyOperator(
+        `⚠️ Failed to call customer back at ${customerNumber}: ${(err as Error).message}`
+      );
+    }
+  }
+
+  console.log(`[self-improve] ===================================`);
+  console.log(`[self-improve]   PIPELINE COMPLETE`);
+  console.log(`[self-improve] ===================================\n`);
+
   return record;
+}
+
+// --- Transcript analysis ---
+
+interface AnalysisResult {
+  failures: string[];
+  changes: string[];
+  configChanges: AssistantConfig;
+  newTools?: {
+    name: string;
+    description: string;
+    parameters: {
+      type: "object";
+      properties: Record<string, { type: string; description: string }>;
+      required?: string[];
+    };
+    handlerCode: string;
+  }[];
+  resourceRequests?: string[];
 }
 
 async function analyzeTranscript(
   transcript: string,
   currentPrompt: string,
-  currentConfig: Record<string, unknown>
-): Promise<{
-  failures: string[];
-  changes: string[];
-  configChanges: AssistantConfig;
-}> {
+  currentConfig: Record<string, unknown>,
+  existingTools: { name: string; description: string }[]
+): Promise<AnalysisResult> {
+  const toolList = existingTools.length
+    ? existingTools.map((t) => `- ${t.name}: ${t.description}`).join("\n")
+    : "NO TOOLS CONFIGURED";
+
   const response = await client.messages.create({
     model: "claude-sonnet-4-5-20250929",
     max_tokens: 4096,
-    system: `You are a self-improving AI system for voice assistants. You analyze failed call transcripts and produce BOTH prompt improvements AND configuration changes.
+    system: `You are a self-improving AI system for voice assistants. You analyze failed call transcripts and:
+1. Improve the prompt and config
+2. CREATE missing tools
+3. Request resources you need but don't have
 
-You work for Ruya Logistics, a freight forwarding company in Dubai. The assistant handles calls about container movements from Jebel Ali port to warehouses across Dubai.
+You work for Ruya Logistics, a freight forwarding company in Dubai that moves containers from Jebel Ali port to warehouses.
 
 ${TUNABLE_PARAMETERS}
 
+${TOOL_CREATION_HINTS}
+
+EXISTING TOOLS:
+${toolList}
+
 Your job:
 1. Read the transcript and identify EVERY specific failure
-2. For each failure, determine which parameter(s) would fix it
-3. Produce the full improved config
+2. For each failure, determine: is it a prompt/config issue OR a missing tool?
+3. Produce the improved config AND any new tools needed
+4. If you need API keys or credentials you don't have, list them as resourceRequests
 
-IMPORTANT: Correlate each failure to the parameter that fixes it. For example:
-- "Caller said numbers were too fast" → voiceSpeed: 0.85, systemMessage: add "spell digits individually"
-- "Response was cut off" → maxTokens: 500
-- "Awkward silence when caller looked up container number" → silenceTimeoutSeconds: 20, messagePlan with idle messages
-- "Agent didn't confirm container size" → systemMessage: add "always confirm 20ft or 40ft"
-- "Caller confused about who they're talking to" → firstMessage improvement
+IMPORTANT — for the improved systemMessage, include a note that the agent should begin callbacks
+with: "Hi, this is Ruya Logistics calling back. I apologize for the issues on our last call.
+I've checked with the team and I now have the right tools to help you. How can I assist?"
 
 Respond with ONLY valid JSON:
 {
   "failures": [
-    "Failure description → FIX: parameter_name"
+    "Failure description → FIX: what parameter or tool fixes it"
   ],
   "changes": [
-    "Human-readable description of each change"
+    "Human-readable description of each change applied"
   ],
   "configChanges": {
     "systemMessage": "the full improved system prompt",
@@ -165,14 +302,28 @@ Respond with ONLY valid JSON:
       "idleTimeoutSeconds": 7,
       "idleMessageMaxSpokenCount": 2
     }
-  }
+  },
+  "newTools": [
+    {
+      "name": "tool_name",
+      "description": "what it does",
+      "parameters": { "type": "object", "properties": {}, "required": [] },
+      "handlerCode": "return 'result'"
+    }
+  ],
+  "resourceRequests": [
+    "Need Whapi API key to send WhatsApp messages to customers",
+    "Need n8n webhook URL to trigger email workflows"
+  ]
 }
 
-Only include parameters in configChanges that actually need to change. Always include systemMessage.`,
+Only include configChanges fields that need changing. Always include systemMessage.
+Only include newTools if tools are actually missing.
+Only include resourceRequests if you truly need credentials you don't have access to.`,
     messages: [
       {
         role: "user",
-        content: `CURRENT SYSTEM PROMPT:\n${currentPrompt}\n\nCURRENT CONFIG:\n${JSON.stringify(currentConfig, null, 2)}\n\nCALL TRANSCRIPT:\n${transcript}\n\nAnalyze ALL failures and produce the improved configuration.`,
+        content: `CURRENT SYSTEM PROMPT:\n${currentPrompt}\n\nCURRENT ASSISTANT CONFIG:\n${JSON.stringify(currentConfig, null, 2)}\n\nCALL TRANSCRIPT:\n${transcript}\n\nAnalyze ALL failures. Improve config, create missing tools, request missing resources.`,
       },
     ],
   });
@@ -197,40 +348,82 @@ Only include parameters in configChanges that actually need to change. Always in
 
 export async function analyzeFromTranscript(
   transcript: string,
-  assistantId: string
+  assistantId: string,
+  customerNumber?: string
 ): Promise<ImprovementRecord> {
   console.log(`\n[self-improve] ===== MANUAL SELF-IMPROVEMENT =====`);
 
   const assistant = await getAssistant(assistantId);
+  const existingTools = getAllTools();
 
   const analysis = await analyzeTranscript(
     transcript,
     assistant.systemMessage,
-    assistant.config
+    assistant.config,
+    existingTools.map((t) => ({ name: t.name, description: t.description }))
   );
+
+  // Create tools
+  const toolsCreated: string[] = [];
+  if (analysis.newTools?.length) {
+    for (const toolSpec of analysis.newTools) {
+      try {
+        await createAndRegisterTool(toolSpec);
+        toolsCreated.push(toolSpec.name);
+      } catch (err) {
+        console.error(`[self-improve] Failed to create tool "${toolSpec.name}":`, err);
+      }
+    }
+  }
+
+  // Resource requests
+  if (analysis.resourceRequests?.length) {
+    for (const req of analysis.resourceRequests) {
+      await notifyOperator(`🔑 RESOURCE REQUEST: ${req}`);
+    }
+  }
 
   await updateAssistant(assistantId, analysis.configChanges);
 
   const record: ImprovementRecord = {
     callId: "manual",
+    customerNumber,
     timestamp: new Date().toISOString(),
     failures: analysis.failures,
     changes: analysis.changes,
+    toolsCreated,
     configBefore: assistant.config,
     configAfter: analysis.configChanges,
+    callbackTriggered: false,
   };
 
   history.push(record);
 
-  console.log(`[self-improve] Failures identified:`);
+  console.log(`[self-improve] Failures:`);
   analysis.failures.forEach((f) => console.log(`   ❌ ${f}`));
-  console.log(`[self-improve] Changes applied:`);
+  console.log(`[self-improve] Changes:`);
   analysis.changes.forEach((c) => console.log(`   ✅ ${c}`));
-  console.log(`[self-improve] ===== IMPROVEMENT COMPLETE =====\n`);
 
   await notifyOperator(
-    `Manual self-improvement:\n\nFailures:\n${analysis.failures.map((f) => `• ${f}`).join("\n")}\n\nChanges:\n${analysis.changes.map((c) => `• ${c}`).join("\n")}`
+    [
+      `🧠 Manual self-improvement complete`,
+      ...analysis.failures.map((f) => `  ❌ ${f}`),
+      ...analysis.changes.map((c) => `  ✅ ${c}`),
+      ...(toolsCreated.length ? toolsCreated.map((t) => `  🔧 ${t}`) : []),
+    ].join("\n")
   );
 
+  // Auto-callback
+  if (customerNumber) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    try {
+      await createOutboundCall(assistantId, customerNumber);
+      record.callbackTriggered = true;
+    } catch (err) {
+      console.error(`[self-improve] Callback failed:`, err);
+    }
+  }
+
+  console.log(`[self-improve] ===== MANUAL IMPROVEMENT COMPLETE =====\n`);
   return record;
 }
