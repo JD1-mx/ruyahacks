@@ -1,5 +1,10 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { getAssistant, updateAssistantPrompt, getCall } from "./vapi.js";
+import {
+  getAssistant,
+  updateAssistant,
+  getCall,
+  type AssistantConfig,
+} from "./vapi.js";
 import { notifyOperator } from "./integrations.js";
 
 const client = new Anthropic();
@@ -11,8 +16,8 @@ export interface ImprovementRecord {
   timestamp: string;
   failures: string[];
   changes: string[];
-  promptBefore: string;
-  promptAfter: string;
+  configBefore: Record<string, unknown>;
+  configAfter: AssistantConfig;
 }
 
 const history: ImprovementRecord[] = [];
@@ -20,6 +25,48 @@ const history: ImprovementRecord[] = [];
 export function getImprovementHistory(): ImprovementRecord[] {
   return history;
 }
+
+// --- The configurable parameters the AI can tune ---
+// Each maps a Vapi field to what failure it fixes
+
+const TUNABLE_PARAMETERS = `
+You can modify ANY of these assistant parameters. Each one fixes specific failure modes:
+
+1. "systemMessage" (string) — The core system prompt / instructions
+   FIXES: Wrong answers, missing domain knowledge, bad tone, no confirmation protocols,
+   not spelling out numbers, not clarifying container sizes (20ft vs 40ft), not repeating
+   booking references, missing escalation behavior, lack of structured data collection.
+
+2. "maxTokens" (number) — Max tokens the LLM can generate per response (current: 250)
+   FIXES: Responses getting cut off mid-sentence, incomplete answers, agent stopping
+   abruptly. Increase to 400-500 if responses are truncated.
+
+3. "voiceSpeed" (number, 0.5 to 2.0) — How fast the voice speaks (current: 1.0)
+   FIXES: Caller saying "slow down", "what?", "can you repeat that?", or numbers being
+   misheard because spoken too fast. Decrease to 0.8-0.9 for number-heavy conversations.
+
+4. "firstMessage" (string) — The greeting when the call starts
+   FIXES: Caller confused about who they're talking to, no context set, caller immediately
+   asking "who is this?". Should identify company, purpose, and invite the request.
+
+5. "silenceTimeoutSeconds" (number) — How long to wait during silence before acting
+   FIXES: Agent hanging up too fast when caller is looking up information (container numbers,
+   booking refs). Increase to 15-30s if callers need time to find details.
+
+6. "maxDurationSeconds" (number) — Maximum call length
+   FIXES: Complex logistics queries getting cut off. Set to 600-900 for detailed shipment inquiries.
+
+7. "messagePlan.idleMessages" (string[]) — Messages spoken when caller is silent
+   FIXES: Awkward silence, caller unsure if agent is still there. Add helpful prompts like
+   "Take your time, I'm here when you're ready" or "Would you like me to repeat that?"
+
+8. "messagePlan.idleTimeoutSeconds" (number) — Seconds before idle message plays
+   FIXES: Agent either jumping in too soon (annoying) or waiting too long (caller hangs up).
+   Set to 5-8 seconds.
+
+9. "messagePlan.idleMessageMaxSpokenCount" (number) — How many idle messages before stopping
+   FIXES: Agent repeating idle messages endlessly. Set to 2-3.
+`;
 
 // --- Core: Analyze transcript + improve ---
 
@@ -30,40 +77,38 @@ export async function analyzeAndImprove(
   console.log(`\n[self-improve] ===== SELF-IMPROVEMENT TRIGGERED =====`);
   console.log(`[self-improve] Analyzing call ${callId}...`);
 
-  // 1. Get the call transcript
   const call = await getCall(callId);
   console.log(`[self-improve] Call status: ${call.status}, ended: ${call.endedReason}`);
   console.log(`[self-improve] Transcript length: ${call.transcript?.length || 0} chars`);
 
-  // 2. Get current assistant prompt
   const assistant = await getAssistant(assistantId);
-  const currentPrompt = assistant.systemMessage;
-  console.log(`[self-improve] Current prompt: ${currentPrompt.length} chars`);
 
-  // 3. Ask Claude to analyze failures and generate improved prompt
-  const analysis = await analyzeTranscript(call.transcript, currentPrompt);
+  const analysis = await analyzeTranscript(
+    call.transcript,
+    assistant.systemMessage,
+    assistant.config
+  );
 
-  // 4. Update the assistant
-  await updateAssistantPrompt(assistantId, analysis.improvedPrompt);
+  await updateAssistant(assistantId, analysis.configChanges);
 
   const record: ImprovementRecord = {
     callId,
     timestamp: new Date().toISOString(),
     failures: analysis.failures,
     changes: analysis.changes,
-    promptBefore: currentPrompt,
-    promptAfter: analysis.improvedPrompt,
+    configBefore: assistant.config,
+    configAfter: analysis.configChanges,
   };
 
   history.push(record);
 
   console.log(`[self-improve] Failures identified:`);
   analysis.failures.forEach((f) => console.log(`   ❌ ${f}`));
-  console.log(`[self-improve] Changes made:`);
+  console.log(`[self-improve] Changes applied:`);
   analysis.changes.forEach((c) => console.log(`   ✅ ${c}`));
+  console.log(`[self-improve] Config keys updated: ${Object.keys(analysis.configChanges).join(", ")}`);
   console.log(`[self-improve] ===== IMPROVEMENT COMPLETE =====\n`);
 
-  // Notify operator
   await notifyOperator(
     `Self-improvement after call ${callId}:\n\nFailures:\n${analysis.failures.map((f) => `• ${f}`).join("\n")}\n\nChanges:\n${analysis.changes.map((c) => `• ${c}`).join("\n")}`
   );
@@ -73,40 +118,61 @@ export async function analyzeAndImprove(
 
 async function analyzeTranscript(
   transcript: string,
-  currentPrompt: string
+  currentPrompt: string,
+  currentConfig: Record<string, unknown>
 ): Promise<{
   failures: string[];
   changes: string[];
-  improvedPrompt: string;
+  configChanges: AssistantConfig;
 }> {
   const response = await client.messages.create({
     model: "claude-sonnet-4-5-20250929",
-    max_tokens: 2048,
-    system: `You are an AI system that improves voice assistant prompts based on failed call transcripts.
+    max_tokens: 4096,
+    system: `You are a self-improving AI system for voice assistants. You analyze failed call transcripts and produce BOTH prompt improvements AND configuration changes.
 
-You work for Ruya Logistics, a freight forwarding company in Dubai that moves containers from Jebel Ali port to warehouses.
+You work for Ruya Logistics, a freight forwarding company in Dubai. The assistant handles calls about container movements from Jebel Ali port to warehouses across Dubai.
+
+${TUNABLE_PARAMETERS}
 
 Your job:
-1. Read the transcript and identify SPECIFIC failures — where the assistant misunderstood, gave wrong info, or frustrated the caller
-2. Generate a CONCRETE list of what went wrong
-3. Produce an improved system prompt that fixes these issues
+1. Read the transcript and identify EVERY specific failure
+2. For each failure, determine which parameter(s) would fix it
+3. Produce the full improved config
 
-Rules for the improved prompt:
-- Keep it concise — this is a voice assistant, not a chatbot
-- Add SPECIFIC instructions to handle the failures you identified
-- Don't remove existing good behavior, only add improvements
-- Focus on practical fixes (e.g., "always spell out numbers digit by digit", "confirm container size: 20ft or 40ft")
+IMPORTANT: Correlate each failure to the parameter that fixes it. For example:
+- "Caller said numbers were too fast" → voiceSpeed: 0.85, systemMessage: add "spell digits individually"
+- "Response was cut off" → maxTokens: 500
+- "Awkward silence when caller looked up container number" → silenceTimeoutSeconds: 20, messagePlan with idle messages
+- "Agent didn't confirm container size" → systemMessage: add "always confirm 20ft or 40ft"
+- "Caller confused about who they're talking to" → firstMessage improvement
 
 Respond with ONLY valid JSON:
 {
-  "failures": ["specific failure 1", "specific failure 2"],
-  "changes": ["what you changed 1", "what you changed 2"],
-  "improvedPrompt": "the full improved system prompt"
-}`,
+  "failures": [
+    "Failure description → FIX: parameter_name"
+  ],
+  "changes": [
+    "Human-readable description of each change"
+  ],
+  "configChanges": {
+    "systemMessage": "the full improved system prompt",
+    "maxTokens": 500,
+    "voiceSpeed": 0.85,
+    "firstMessage": "improved greeting",
+    "silenceTimeoutSeconds": 20,
+    "messagePlan": {
+      "idleMessages": ["Take your time, I'm still here."],
+      "idleTimeoutSeconds": 7,
+      "idleMessageMaxSpokenCount": 2
+    }
+  }
+}
+
+Only include parameters in configChanges that actually need to change. Always include systemMessage.`,
     messages: [
       {
         role: "user",
-        content: `CURRENT SYSTEM PROMPT:\n${currentPrompt}\n\nCALL TRANSCRIPT:\n${transcript}\n\nAnalyze the failures and produce an improved prompt.`,
+        content: `CURRENT SYSTEM PROMPT:\n${currentPrompt}\n\nCURRENT CONFIG:\n${JSON.stringify(currentConfig, null, 2)}\n\nCALL TRANSCRIPT:\n${transcript}\n\nAnalyze ALL failures and produce the improved configuration.`,
       },
     ],
   });
@@ -120,14 +186,14 @@ Respond with ONLY valid JSON:
   } catch {
     console.error("[self-improve] Failed to parse analysis:", text);
     return {
-      failures: ["Could not parse analysis"],
-      changes: ["No changes made"],
-      improvedPrompt: currentPrompt,
+      failures: ["Could not parse analysis output"],
+      changes: ["No changes made — parse error"],
+      configChanges: { systemMessage: currentPrompt },
     };
   }
 }
 
-// --- Manual trigger: analyze from transcript text directly ---
+// --- Manual trigger with raw transcript ---
 
 export async function analyzeFromTranscript(
   transcript: string,
@@ -136,25 +202,29 @@ export async function analyzeFromTranscript(
   console.log(`\n[self-improve] ===== MANUAL SELF-IMPROVEMENT =====`);
 
   const assistant = await getAssistant(assistantId);
-  const currentPrompt = assistant.systemMessage;
 
-  const analysis = await analyzeTranscript(transcript, currentPrompt);
-  await updateAssistantPrompt(assistantId, analysis.improvedPrompt);
+  const analysis = await analyzeTranscript(
+    transcript,
+    assistant.systemMessage,
+    assistant.config
+  );
+
+  await updateAssistant(assistantId, analysis.configChanges);
 
   const record: ImprovementRecord = {
     callId: "manual",
     timestamp: new Date().toISOString(),
     failures: analysis.failures,
     changes: analysis.changes,
-    promptBefore: currentPrompt,
-    promptAfter: analysis.improvedPrompt,
+    configBefore: assistant.config,
+    configAfter: analysis.configChanges,
   };
 
   history.push(record);
 
   console.log(`[self-improve] Failures identified:`);
   analysis.failures.forEach((f) => console.log(`   ❌ ${f}`));
-  console.log(`[self-improve] Changes made:`);
+  console.log(`[self-improve] Changes applied:`);
   analysis.changes.forEach((c) => console.log(`   ✅ ${c}`));
   console.log(`[self-improve] ===== IMPROVEMENT COMPLETE =====\n`);
 
