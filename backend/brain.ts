@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { BrainDecision } from "./types.js";
 import { getAllTools, getTool, createAndRegisterTool } from "./tools.js";
+import { updateAssistantPrompt } from "./vapi.js";
 
 const client = new Anthropic();
 
@@ -12,6 +13,7 @@ Your capabilities:
 2. Create NEW tools when you don't have the right one (this is your superpower)
 3. Respond directly when no tool is needed
 4. Escalate to human operators when something is beyond your abilities
+5. Update your own system prompt on VAPI when you need to change how you behave
 
 IMPORTANT: You are a SELF-IMPROVING agent. When a request requires a capability you don't have,
 you CREATE a new tool instead of saying "I can't do that".
@@ -36,7 +38,10 @@ Respond with ONLY valid JSON matching one of these shapes:
 {"action":"respond","response":"Your message here"}
 
 4. Escalate to human:
-{"action":"escalate","escalationReason":"Why this needs human help"}`;
+{"action":"escalate","escalationReason":"Why this needs human help"}
+
+5. Update the VAPI assistant prompt (use when behavior/instructions need to change):
+{"action":"update_prompt","newPrompt":"The full new system prompt text"}`;
 
 function buildToolContext(): string {
   const tools = getAllTools();
@@ -117,6 +122,19 @@ async function executeDecision(decision: BrainDecision): Promise<string> {
       const { notifyOperator } = await import("./integrations.js");
       await notifyOperator(`ESCALATION: ${decision.escalationReason}`);
       return `I've escalated this to our operations team: ${decision.escalationReason}. They'll follow up shortly.`;
+    }
+
+    case "update_prompt": {
+      if (!decision.newPrompt) return "No prompt provided.";
+      const assistantId = process.env.VAPI_ASSISTANT_ID;
+      if (!assistantId) return "VAPI_ASSISTANT_ID not configured.";
+
+      console.log(`[brain] 📝 SELF-IMPROVING: Updating assistant prompt`);
+      await updateAssistantPrompt(assistantId, decision.newPrompt);
+      const { notifyOperator: notify } = await import("./integrations.js");
+      await notify(`📝 Agent updated its own prompt on VAPI`);
+      console.log(`[brain] ✅ Prompt updated on VAPI assistant ${assistantId}`);
+      return "System prompt updated successfully.";
     }
 
     case "respond":

@@ -273,6 +273,7 @@ app.get("/improvements/log", (_req, res) => {
       callId: r.callId,
       customerNumber: r.customerNumber,
       timestamp: r.timestamp,
+      transcript: r.transcript,
       failures: r.failures,
       changes: r.changes,
       toolsCreated: r.toolsCreated,

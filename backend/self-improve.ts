@@ -25,6 +25,7 @@ export interface ImprovementRecord {
   callId: string;
   customerNumber?: string;
   timestamp: string;
+  transcript?: string;
   failures: string[];
   changes: string[];
   toolsCreated: string[];
@@ -89,14 +90,56 @@ You can modify ANY of these assistant parameters. Each one fixes specific failur
 
 // --- What the AI knows about tool creation ---
 
-const TOOL_CREATION_HINTS = `
-TOOL CREATION — You are a self-improving agent. If the conversation failed because you lacked
-a capability, you MUST create it. That is your entire purpose.
+function buildToolCreationHints(): string {
+  const whapiToken = process.env.WHAPI_TOKEN || "";
+  const hasWhapi = Boolean(whapiToken);
 
-You have TWO ways to create capabilities:
+  return `
+TOOL & WORKFLOW CREATION — You are a self-improving agent. If the conversation failed because
+the agent lacked a capability (WhatsApp, email, SMS, data lookup, etc.), you MUST create it.
+That is your ENTIRE purpose.
 
-== 1. VAPI TOOLS (callable by the voice assistant during a call) ==
-Tool spec format:
+=== THE FLOW (this is how it works, follow it exactly) ===
+
+STEP 1: Identify what capability is missing from the transcript
+  Example: "Customer asked to send WhatsApp update but agent couldn't"
+
+STEP 2: Create an n8n workflow (in "newWorkflows") that performs the action.
+  - Every workflow STARTS with a webhook trigger (we handle this automatically)
+  - Each step is an HTTP request to an external API
+  - When the workflow is created, it gets a PRODUCTION webhook URL
+  - That webhook URL then becomes the tool endpoint
+
+STEP 3: The system AUTOMATICALLY does this (you don't need to):
+  - Creates a Vapi tool linked to the n8n webhook URL
+  - Attaches the tool to the voice assistant
+  - Publishes the updated assistant
+
+So: You create the workflow spec → we deploy it → wire it to Vapi → assistant updated.
+
+=== WORKFLOW SPEC FORMAT ===
+{
+  "type": "custom",
+  "name": "Human Readable Name",
+  "webhookPath": "unique-kebab-path",
+  "steps": [
+    {
+      "name": "Step Name",
+      "method": "POST",
+      "url": "https://api.example.com/endpoint",
+      "headers": { "Authorization": "Bearer TOKEN", "Content-Type": "application/json" },
+      "bodyTemplate": "={ \\"key\\": \\"{{ $json.body.value }}\\" }"
+    }
+  ]
+}
+
+=== AVAILABLE CREDENTIALS ===
+${hasWhapi ? `- Whapi (WhatsApp): Token available. Use this header: { "Authorization": "Bearer ${whapiToken}", "Content-Type": "application/json" }
+  - Send text: POST https://gate.whapi.cloud/messages/text — body: { "to": "PHONE@s.whatsapp.net", "body": "message" }
+  - Send image: POST https://gate.whapi.cloud/messages/image — body: { "to": "PHONE@s.whatsapp.net", "media": { "url": "..." } }` : `- Whapi (WhatsApp): NOT CONFIGURED — add to resourceRequests`}
+
+=== DIRECT VAPI TOOLS (use when no n8n workflow is needed) ===
+For simple data lookups or single API calls, create a direct tool:
 {
   "name": "snake_case_tool_name",
   "description": "What it does",
@@ -105,40 +148,20 @@ Tool spec format:
     "properties": { "param": { "type": "string", "description": "..." } },
     "required": ["param"]
   },
-  "handlerCode": "JS code with access to ctx.sendWhatsApp(phone, msg), ctx.notifyOperator(msg), ctx.triggerN8nWorkflow(data), ctx.fetch(url, opts). MUST return a string."
+  "handlerCode": "JS code. Access: ctx.sendWhatsApp(phone, msg), ctx.notifyOperator(msg), ctx.fetch(url, opts). MUST return a string."
 }
 
-== 2. N8N WORKFLOWS (multi-step automations deployed to n8n) ==
-You can create workflows on n8n that get a webhook URL you can call from tools.
-Workflow spec format:
-{
-  "type": "custom",
-  "name": "Workflow Name",
-  "webhookPath": "unique-path-name",
-  "steps": [
-    {
-      "name": "Step Name",
-      "method": "POST",
-      "url": "https://api.example.com/endpoint",
-      "headers": { "Authorization": "Bearer token" },
-      "bodyTemplate": "={ \\"key\\": \\"{{ $json.body.value }}\\" }"
-    }
-  ]
-}
+=== WHEN TO USE WHICH ===
+- WhatsApp messaging → n8n workflow (uses Whapi API)
+- Email sending → n8n workflow (uses SMTP or email API)
+- Data lookup (shipment status, etc.) → Direct Vapi tool with ctx.fetch()
+- Multi-step automation → n8n workflow
 
-== HINTS ==
-- If WhatsApp messaging is needed, you should prefer Whapi (https://gate.whapi.cloud).
-  Research the Whapi API for how to send messages. Look at the EXISTING WORKFLOWS below
-  for any WhatsApp integrations already built in this n8n account — use those as reference
-  for how it's been done before. Pick the best pattern you find.
-- For email, look at existing n8n workflows for email patterns.
-- For data lookups, create a Vapi tool directly with ctx.fetch().
-- You can chain: create an n8n workflow first, then a Vapi tool that calls its webhook.
-
-If you need an API key or credential you don't have, add it to "resourceRequests".
-
-IMPORTANT: Don't be afraid to create tools and workflows. Figure it out. That IS the point.
+CRITICAL: If the caller asked for a capability (WhatsApp, email, status lookup) and the agent
+couldn't provide it, you MUST create both the workflow AND the tool. Do NOT just improve the
+prompt — the agent needs the actual capability.
 `;
+}
 
 // --- Core: Full self-improvement pipeline ---
 
@@ -180,7 +203,11 @@ export async function analyzeAndImprove(
   const existingTools = getAllTools();
   logStep(log, "check_tools", "ok", `${existingTools.length} existing tools: ${existingTools.map(t => t.name).join(", ") || "none"}`);
 
-  // 2. Analyze with Claude
+  // 2. Log the transcript being analyzed
+  const transcriptPreview = call.transcript?.slice(0, 300) || "(empty)";
+  logStep(log, "transcript_preview", "ok", transcriptPreview);
+
+  // Analyze with Claude
   logStep(log, "ai_analysis", "ok", "Sending transcript to Claude for analysis...");
   let analysis;
   let rawAnalysisText = "";
@@ -199,7 +226,16 @@ export async function analyzeAndImprove(
     throw err;
   }
 
-  // 3. Create tools
+  // 3. Update assistant config FIRST (before attaching tools — prevents model PATCH from overwriting toolIds)
+  logStep(log, "update_assistant", "ok", "Applying config changes to Vapi assistant (prompt, maxTokens, voice, etc.)...");
+  try {
+    await updateAssistant(assistantId, analysis.configChanges);
+    logStep(log, "update_assistant", "ok", `Updated: ${Object.keys(analysis.configChanges).join(", ")}`);
+  } catch (err) {
+    logStep(log, "update_assistant", "error", `Failed to update assistant: ${(err as Error).message}`);
+  }
+
+  // 4. Create direct Vapi tools (registered locally + on Vapi + attached to assistant)
   const toolsCreated: string[] = [];
   if (analysis.newTools?.length) {
     for (const toolSpec of analysis.newTools) {
@@ -275,7 +311,7 @@ export async function analyzeAndImprove(
     logStep(log, "create_workflow", "skipped", "No new workflows requested by analysis");
   }
 
-  // 5. Resource requests
+  // 6. Resource requests
   if (analysis.resourceRequests?.length) {
     for (const req of analysis.resourceRequests) {
       await notifyOperator(`🔑 RESOURCE REQUEST: ${req}`);
@@ -283,20 +319,20 @@ export async function analyzeAndImprove(
     }
   }
 
-  // 6. Update assistant
-  logStep(log, "update_assistant", "ok", "Applying config changes to Vapi assistant...");
+  // 7. Final verification — fetch assistant to confirm tools are attached
   try {
-    await updateAssistant(assistantId, analysis.configChanges);
-    logStep(log, "update_assistant", "ok", `Updated: ${Object.keys(analysis.configChanges).join(", ")}`);
-  } catch (err) {
-    logStep(log, "update_assistant", "error", `Failed to update assistant: ${(err as Error).message}`);
+    const updated = await getAssistant(assistantId);
+    const currentToolIds = (updated.config as { toolIds?: string[] })?.toolIds || [];
+    logStep(log, "verify_assistant", "ok", `Assistant published with ${currentToolIds.length} tools attached. Prompt length: ${updated.systemMessage.length} chars`);
+  } catch {
+    logStep(log, "verify_assistant", "error", "Could not verify final assistant state");
   }
 
-  // 7. Record
   const record: ImprovementRecord = {
     callId,
     customerNumber,
     timestamp: new Date().toISOString(),
+    transcript: call.transcript,
     failures: analysis.failures,
     changes: analysis.changes,
     toolsCreated,
@@ -309,7 +345,7 @@ export async function analyzeAndImprove(
   };
   history.push(record);
 
-  // 8. Notify operator
+  // Notify operator
   await notifyOperator(
     [
       `🧠 Self-improvement complete (call ${callId})`,
@@ -322,7 +358,7 @@ export async function analyzeAndImprove(
     ].join("\n")
   );
 
-  // 9. Auto-callback
+  // Auto-callback
   if (customerNumber) {
     logStep(log, "callback", "ok", `Triggering callback to ${customerNumber}...`);
     await new Promise((resolve) => setTimeout(resolve, 3000));
@@ -425,7 +461,7 @@ You work for Ruya Logistics, a freight forwarding company in Dubai that moves co
 
 ${TUNABLE_PARAMETERS}
 
-${TOOL_CREATION_HINTS}
+${buildToolCreationHints()}
 
 EXISTING TOOLS ON VAPI:
 ${toolList}
@@ -496,7 +532,12 @@ Respond with ONLY valid JSON:
 Only include configChanges fields that need changing. Always include systemMessage.
 Only include newTools if tools are actually missing.
 Only include newWorkflows if multi-step automations are needed (WhatsApp, email, etc).
-Only include resourceRequests if you truly need credentials you don't have access to.`,
+Only include resourceRequests if you truly need credentials you don't have access to.
+
+HOW PROMPT UPDATES WORK: When you set "systemMessage" in configChanges, it gets applied to the
+VAPI assistant via the "instructions" field (PATCH /assistant/{id} with { instructions: "..." }).
+This is the correct way to update the agent's behavior on VAPI. The system will handle this automatically
+— just put the full improved prompt in configChanges.systemMessage.`,
     messages: [
       {
         role: "user",
@@ -545,7 +586,10 @@ export async function analyzeFromTranscript(
     existingTools.map((t) => ({ name: t.name, description: t.description }))
   );
 
-  // Create tools
+  // Update assistant config FIRST (before attaching tools)
+  await updateAssistant(assistantId, analysis.configChanges);
+
+  // Create direct tools
   const toolsCreated: string[] = [];
   if (analysis.newTools?.length) {
     for (const toolSpec of analysis.newTools) {
@@ -558,14 +602,47 @@ export async function analyzeFromTranscript(
     }
   }
 
+  // Create n8n workflows
+  const workflowsCreated: string[] = [];
+  if (analysis.newWorkflows?.length && isN8nConfigured()) {
+    for (const wf of analysis.newWorkflows) {
+      try {
+        if (!wf.steps?.length) continue;
+        const result = await createCustomWorkflow({
+          name: wf.name,
+          webhookPath: wf.webhookPath,
+          steps: wf.steps,
+        });
+        workflowsCreated.push(`${wf.name} → ${result.webhookUrl}`);
+
+        // Wire workflow to Vapi tool
+        const toolName = wf.webhookPath.replace(/-/g, "_");
+        await createAndRegisterTool({
+          name: toolName,
+          description: `${wf.name} — triggers n8n workflow via webhook`,
+          parameters: {
+            type: "object",
+            properties: {
+              to: { type: "string", description: "Recipient phone number or identifier" },
+              message: { type: "string", description: "Message content to send" },
+            },
+            required: ["to", "message"],
+          },
+          handlerCode: `const res = await ctx.fetch("${result.webhookUrl}", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to: args.to, message: args.message }) }); const data = await res.json(); return JSON.stringify(data);`,
+        });
+        toolsCreated.push(toolName);
+      } catch (err) {
+        console.error(`[self-improve] Failed to create workflow "${wf.name}":`, err);
+      }
+    }
+  }
+
   // Resource requests
   if (analysis.resourceRequests?.length) {
     for (const req of analysis.resourceRequests) {
       await notifyOperator(`🔑 RESOURCE REQUEST: ${req}`);
     }
   }
-
-  await updateAssistant(assistantId, analysis.configChanges);
 
   const record: ImprovementRecord = {
     callId: "manual",
@@ -574,7 +651,7 @@ export async function analyzeFromTranscript(
     failures: analysis.failures,
     changes: analysis.changes,
     toolsCreated,
-    workflowsCreated: [],
+    workflowsCreated,
     configBefore: assistant.config,
     configAfter: analysis.configChanges,
     callbackTriggered: false,

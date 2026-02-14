@@ -64,7 +64,7 @@ export interface RegisteredTool {
 // --- Brain ---
 
 export interface BrainDecision {
-  action: "execute_tool" | "create_tool" | "respond" | "escalate";
+  action: "execute_tool" | "create_tool" | "respond" | "escalate" | "update_prompt";
   toolName?: string;
   toolArgs?: Record<string, unknown>;
   response?: string;
@@ -75,6 +75,7 @@ export interface BrainDecision {
     handlerCode: string;
   };
   escalationReason?: string;
+  newPrompt?: string;
 }
 
 // --- WhatsApp ---

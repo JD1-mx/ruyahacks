@@ -71,8 +71,9 @@ export async function createAndRegisterTool(spec: {
         },
       };
       const toolId = await createVapiTool(vapiToolDef, `${serverUrl}/vapi/tool-calls`);
+      console.log(`[tools] Tool "${spec.name}" registered on Vapi → toolId: ${toolId}`);
       await addToolToAssistant(assistantId, toolId);
-      console.log(`[tools] Tool "${spec.name}" synced to Vapi`);
+      console.log(`[tools] Tool "${spec.name}" ATTACHED to assistant ${assistantId} — assistant updated`);
     } catch (err) {
       console.error(`[tools] Failed to sync "${spec.name}" to Vapi:`, err);
     }

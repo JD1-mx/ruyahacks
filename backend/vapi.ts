@@ -43,6 +43,28 @@ export interface AssistantConfig {
   [key: string]: unknown;
 }
 
+// Extract system message from whatever format Vapi uses
+function extractSystemMessage(assistant: Record<string, unknown>): string {
+  // Preferred: "instructions" at root level (current Vapi format)
+  if (typeof assistant.instructions === "string") return assistant.instructions;
+
+  // Fallback: model.messages or llm.messages (older format)
+  const model = assistant.model as Record<string, unknown> | undefined;
+  const llm = assistant.llm as Record<string, unknown> | undefined;
+  const source = model || llm;
+
+  if (source) {
+    const messages = source.messages as Array<{ role: string; content: string }> | undefined;
+    if (messages?.length) {
+      const sys = messages.find((m) => m.role === "system");
+      if (sys) return sys.content;
+    }
+    if (typeof source.systemMessage === "string") return source.systemMessage;
+  }
+
+  return "";
+}
+
 export async function getAssistant(
   assistantId: string
 ): Promise<{ systemMessage: string; config: Record<string, unknown> }> {
@@ -50,11 +72,48 @@ export async function getAssistant(
     `/assistant/${assistantId}`,
     "GET"
   )) as Record<string, unknown>;
-  const model = result.model as { systemMessage?: string } | undefined;
+
   return {
-    systemMessage: model?.systemMessage || "",
+    systemMessage: extractSystemMessage(result),
     config: result,
   };
+}
+
+// Get the current LLM config (provider, model, etc.) for PATCH operations
+async function getCurrentLlmConfig(assistantId: string): Promise<{
+  field: "model" | "llm";
+  provider: string;
+  modelName: string;
+  existing: Record<string, unknown>;
+}> {
+  const result = (await vapiRequest(
+    `/assistant/${assistantId}`,
+    "GET"
+  )) as Record<string, unknown>;
+
+  // Vapi uses either "model" or "llm" depending on version
+  const model = result.model as Record<string, unknown> | undefined;
+  const llm = result.llm as Record<string, unknown> | undefined;
+
+  if (model?.provider) {
+    return {
+      field: "model",
+      provider: model.provider as string,
+      modelName: model.model as string,
+      existing: model,
+    };
+  }
+  if (llm?.provider) {
+    return {
+      field: "llm",
+      provider: llm.provider as string,
+      modelName: llm.model as string,
+      existing: llm,
+    };
+  }
+
+  // Fallback
+  return { field: "model", provider: "openai", modelName: "gpt-4o", existing: {} };
 }
 
 export async function updateAssistant(
@@ -63,16 +122,31 @@ export async function updateAssistant(
 ): Promise<void> {
   const patch: Record<string, unknown> = {};
 
-  // Model-level changes
-  const modelPatch: Record<string, unknown> = {};
-  if (changes.systemMessage !== undefined) modelPatch.systemMessage = changes.systemMessage;
-  if (changes.maxTokens !== undefined) modelPatch.maxTokens = changes.maxTokens;
-  if (changes.toolIds !== undefined) modelPatch.toolIds = changes.toolIds;
-  if (Object.keys(modelPatch).length > 0) patch.model = modelPatch;
+  // System prompt — Vapi uses "instructions" at root level
+  if (changes.systemMessage !== undefined) {
+    patch.instructions = changes.systemMessage;
+  }
 
-  // Voice speed
+  // LLM config changes (maxTokens goes inside the llm/model object)
+  if (changes.maxTokens !== undefined) {
+    const llmConfig = await getCurrentLlmConfig(assistantId);
+    patch[llmConfig.field] = {
+      provider: llmConfig.provider,
+      model: llmConfig.modelName,
+      maxTokens: changes.maxTokens,
+    };
+  }
+
+  // toolIds — at root level
+  if (changes.toolIds !== undefined) {
+    patch.toolIds = changes.toolIds;
+  }
+
+  // Voice speed — preserve existing voice config
   if (changes.voiceSpeed !== undefined) {
-    patch.voice = { speed: changes.voiceSpeed };
+    const result = (await vapiRequest(`/assistant/${assistantId}`, "GET")) as Record<string, unknown>;
+    const currentVoice = result.voice as Record<string, unknown> | undefined;
+    patch.voice = { ...currentVoice, speed: changes.voiceSpeed };
   }
 
   // First message
@@ -85,13 +159,18 @@ export async function updateAssistant(
   // Message plan (idle messages)
   if (changes.messagePlan !== undefined) patch.messagePlan = changes.messagePlan;
 
+  if (Object.keys(patch).length === 0) {
+    console.log(`[vapi] No changes to apply to assistant ${assistantId}`);
+    return;
+  }
+
   await vapiRequest(`/assistant/${assistantId}`, "PATCH", patch);
 
   const keys = Object.keys(patch);
   console.log(`[vapi] Updated assistant ${assistantId}: ${keys.join(", ")}`);
 }
 
-// Convenience wrapper kept for backward compat
+// Convenience wrapper
 export async function updateAssistantPrompt(
   assistantId: string,
   newSystemPrompt: string
@@ -106,10 +185,10 @@ export async function createAssistant(
 ): Promise<string> {
   const payload = {
     name,
+    instructions: systemPrompt,
     model: {
       provider: "anthropic",
       model: "claude-sonnet-4-5-20250929",
-      systemMessage: systemPrompt,
     },
     voice: {
       provider: "11labs",
@@ -184,16 +263,21 @@ export async function listRecentCalls(
   ) as Promise<unknown[]>;
 }
 
-// --- Tool management (secondary feature) ---
+// --- Tool management ---
 
 export async function createVapiTool(
   tool: VapiToolDefinition,
   serverUrl: string
 ): Promise<string> {
+  // Vapi expects: name/description at root, server inside function
   const payload = {
     type: "function",
-    function: tool.function,
-    server: { url: serverUrl },
+    name: tool.function.name,
+    description: tool.function.description,
+    function: {
+      parameters: tool.function.parameters,
+      server: { url: serverUrl },
+    },
   };
 
   const result = (await vapiRequest("/tool", "POST", payload)) as {
@@ -210,13 +294,14 @@ export async function addToolToAssistant(
   const assistant = (await vapiRequest(
     `/assistant/${assistantId}`,
     "GET"
-  )) as { model?: { toolIds?: string[] } };
+  )) as { toolIds?: string[] };
 
-  const existingIds = assistant.model?.toolIds || [];
+  const existingIds = assistant.toolIds || [];
 
+  // toolIds is at root level (not inside model/llm)
   await vapiRequest(`/assistant/${assistantId}`, "PATCH", {
-    model: { toolIds: [...existingIds, toolId] },
+    toolIds: [...existingIds, toolId],
   });
 
-  console.log(`[vapi] Added tool ${toolId} to assistant ${assistantId}`);
+  console.log(`[vapi] Added tool ${toolId} to assistant ${assistantId} (now ${existingIds.length + 1} tools)`);
 }
