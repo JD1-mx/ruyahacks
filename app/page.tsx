@@ -570,25 +570,28 @@ export default function DemoPage() {
                   {callData.messages
                     .filter(
                       (m) =>
-                        (m.role === "assistant" || m.role === "user") &&
+                        (m.role === "assistant" || m.role === "bot" || m.role === "user") &&
                         (m.message || m.content),
                     )
-                    .map((m, i) => (
-                      <div
-                        key={i}
-                        className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
-                      >
+                    .map((m, i) => {
+                      const isUser = m.role === "user";
+                      return (
                         <div
-                          className={`max-w-[80%] rounded-xl px-4 py-2 text-sm ${
-                            m.role === "user"
-                              ? "bg-brand text-white"
-                              : "bg-gray-100 text-gray-900 dark:bg-neutral-800 dark:text-gray-100"
-                          }`}
+                          key={i}
+                          className={`flex ${isUser ? "justify-end" : "justify-start"}`}
                         >
-                          {m.message || m.content}
+                          <div
+                            className={`max-w-[80%] rounded-xl px-4 py-2 text-sm ${
+                              isUser
+                                ? "bg-brand text-white"
+                                : "bg-gray-100 text-gray-900 dark:bg-neutral-800 dark:text-gray-100"
+                            }`}
+                          >
+                            {m.message || m.content}
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                 </div>
               </div>
             ) : callData.transcript ? (
@@ -768,6 +771,18 @@ export default function DemoPage() {
                             </div>
                           </div>
                         )}
+
+                      {/* Raw Analysis — AI thinking process */}
+                      {imp.rawAnalysis && (
+                        <details className="group">
+                          <summary className="cursor-pointer text-sm font-medium text-muted-foreground hover:text-foreground">
+                            View AI Analysis (full reasoning)
+                          </summary>
+                          <pre className="mt-2 max-h-96 overflow-auto rounded-lg bg-gray-50 p-3 font-mono text-xs whitespace-pre-wrap dark:bg-neutral-900">
+                            {imp.rawAnalysis}
+                          </pre>
+                        </details>
+                      )}
                     </div>
                   ))}
 
