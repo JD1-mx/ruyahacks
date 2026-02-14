@@ -188,23 +188,47 @@ export async function analyzeAndImprove(
     }
   }
 
-  // 3b. Create n8n workflows
+  // 3b. Create n8n workflows → then create Vapi tools pointing to their webhook URLs
   const workflowsCreated: { name: string; webhookUrl: string }[] = [];
   if (analysis.newWorkflows?.length && isN8nConfigured()) {
     for (const wf of analysis.newWorkflows) {
       try {
         console.log(`[self-improve] Creating n8n workflow: "${wf.name}"`);
-        if (wf.steps?.length) {
-          const result = await createCustomWorkflow({
-            name: wf.name,
-            webhookPath: wf.webhookPath,
-            steps: wf.steps,
-          });
-          workflowsCreated.push({ name: wf.name, webhookUrl: result.webhookUrl });
-          console.log(`[self-improve] ✅ Workflow "${wf.name}" deployed: ${result.webhookUrl}`);
-        } else {
+        if (!wf.steps?.length) {
           console.warn(`[self-improve] Workflow "${wf.name}" has no steps — skipping`);
+          continue;
         }
+
+        const result = await createCustomWorkflow({
+          name: wf.name,
+          webhookPath: wf.webhookPath,
+          steps: wf.steps,
+        });
+        workflowsCreated.push({ name: wf.name, webhookUrl: result.webhookUrl });
+        console.log(`[self-improve] ✅ Workflow "${wf.name}" deployed: ${result.webhookUrl}`);
+
+        // Now create a Vapi tool that calls this n8n production webhook URL
+        // and attach it to the assistant so it's available in voice calls
+        const toolName = wf.webhookPath.replace(/-/g, "_");
+        const webhookUrl = result.webhookUrl;
+        console.log(`[self-improve] Creating Vapi tool "${toolName}" → ${webhookUrl}`);
+
+        await createAndRegisterTool({
+          name: toolName,
+          description: `${wf.name} — triggers n8n workflow via webhook`,
+          parameters: {
+            type: "object",
+            properties: {
+              to: { type: "string", description: "Recipient phone number or identifier" },
+              message: { type: "string", description: "Message content to send" },
+            },
+            required: ["to", "message"],
+          },
+          handlerCode: `const res = await ctx.fetch("${webhookUrl}", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to: args.to, message: args.message }) }); const data = await res.json(); return JSON.stringify(data);`,
+        });
+        toolsCreated.push(toolName);
+        console.log(`[self-improve] ✅ Vapi tool "${toolName}" created and attached to assistant`);
+
       } catch (err) {
         console.error(`[self-improve] Failed to create workflow "${wf.name}":`, err);
       }
