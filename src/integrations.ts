@@ -1,5 +1,5 @@
 const WHAPI_BASE = process.env.WHAPI_BASE_URL || "https://gate.whapi.cloud";
-const WHAPI_KEY = process.env.WHAPI_API_KEY || "";
+const WHAPI_TOKEN = process.env.WHAPI_TOKEN || "";
 const N8N_WEBHOOK = process.env.N8N_WEBHOOK_URL || "";
 
 export async function sendWhatsApp(
@@ -11,7 +11,7 @@ export async function sendWhatsApp(
   const res = await fetch(`${WHAPI_BASE}/messages/text`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${WHAPI_KEY}`,
+      Authorization: `Bearer ${WHAPI_TOKEN}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ to: chatId, body }),
